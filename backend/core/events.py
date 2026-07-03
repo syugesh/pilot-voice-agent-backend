@@ -18,6 +18,15 @@ async def startup_pipeline():
     from pipeline.front_llm import FrontLLMWorker
     from core.bg_supervisor import bg_supervisor
 
+    # Warm up the WeSpeaker embedding model in the background now, rather than
+    # lazily on first use. Without this, the VAD's streaming per-window embed
+    # extraction (services/enrollment.py extract()) runs before the model has
+    # loaded and silently falls back to a random hash-based stub embedding for
+    # every turn until something else happens to trigger the lazy load — which
+    # made early speaker identification look like it was randomly failing.
+    from services.enrollment import embed_provider
+    asyncio.create_task(asyncio.to_thread(embed_provider.load), name="WeSpeakerWarmup")
+
     workers = [
         SileroVADWorker(bus),
         SmartTurnWorker(bus),

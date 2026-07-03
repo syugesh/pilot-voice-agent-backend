@@ -1,12 +1,13 @@
 # Web
-fastapi==0.111.0
-uvicorn[standard]==0.30.0
-python-multipart==0.0.9
+fastapi>=0.115.0
+uvicorn[standard]>=0.31.1
+python-multipart>=0.0.9
+email-validator>=2.0.0
 
 # Auth
 python-jose[cryptography]==3.3.0
 bcrypt==4.1.3
-pydantic-settings==2.3.0
+pydantic-settings>=2.5.2
 
 # Database
 aiosqlite==0.20.0
@@ -27,13 +28,12 @@ kokoro-onnx
 soundfile==0.12.1
 
 # HTTP
-httpx==0.27.0
+httpx>=0.27.1
 slowapi==0.1.9
 
 # MCP client (stdio transport for flight-mcp Node server)
-# sse-starlette pinned to 2.x to stay compatible with starlette==0.37.2
 mcp==1.28.0
-sse-starlette==2.1.3
+sse-starlette>=2.1.3
 
 # AI APIs
 google-generativeai==0.7.2

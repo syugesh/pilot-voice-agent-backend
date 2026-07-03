@@ -1,5 +1,12 @@
 [
   {
+    "session_id": "4f35317f-65e0-4f29-baa2-a6baee2fcc82",
+    "title": "Introduction to Machine Learning for Beginners",
+    "description": "create a presentation on machine learning for beginners",
+    "slide_count": 5,
+    "created_at": "2026-07-02T22:54:14"
+  },
+  {
     "session_id": "anon-mqyr78rj-r5oye0gbudc",
     "title": "Mastering Kubernetes: From Basics to Advanced Deployment",
     "description": "create a PPT for kubernetes from basic to advanced",

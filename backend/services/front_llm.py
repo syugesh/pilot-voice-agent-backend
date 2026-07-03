@@ -43,6 +43,24 @@ def _parse_natural_date(text: str) -> str | None:
     if m:
         return _make(_MONTH_MAP[m.group(2)], int(m.group(1)))
 
+    # Bare ordinal day, no month given — "for the 10th", "on 10th" → nearest
+    # upcoming occurrence (this month, or next month if that day already passed).
+    # Ordinal suffix is required so this doesn't fire on "1st class" etc.
+    m = re.search(r'\b(\d{1,2})(?:st|nd|rd|th)\b(?!\s*class)', t)
+    if m:
+        day = int(m.group(1))
+        if 1 <= day <= 31:
+            month, year = today.month, today.year
+            try:
+                d = datetime.date(year, month, day)
+                if d < today:
+                    month = month + 1 if month < 12 else 1
+                    year  = year if month != 1 else year + 1
+                    d = datetime.date(year, month, day)
+                return d.isoformat()
+            except ValueError:
+                pass
+
     return None
 
 logger = logging.getLogger("pilot.front_llm")
@@ -208,7 +226,7 @@ def _ollama_chat_sync(messages: list[dict]) -> str:
         model=settings.OLLAMA_MODEL,
         messages=messages,
         think=False,               # disable Qwen3 thinking — cuts ~50s off latency
-        options={"num_predict": 80},  # classification needs very few tokens (just JSON)
+        options={"num_predict": 200},  # headroom for full delegate JSON (preamble+tool+args+mode)
         stream=False,
     )
     # Support both dict and attribute access (ollama package version differences)
@@ -264,6 +282,7 @@ class FrontLLMProvider:
                     for c in context[-5:]
                 )
                 user_msg = (
+                    f"Today's date: {datetime.date.today().isoformat()}\n"
                     f"Usecase: {usecase}\n"
                     f"Recent context:\n{ctx_str}\n\n"
                     f"Speaker: {speaker_id} ({role})\n"
@@ -334,19 +353,25 @@ class FrontLLMProvider:
                 m2 = re.search(r'\bto\s+([a-zA-Z ]+?)(?:\s+on\b|\s+from\b|\s*$)', t)
                 if m2:
                     args.setdefault("destination", m2.group(1).strip())
-            # Date extraction — order: tomorrow/today → ISO → natural language ("July 17")
-            if "tomorrow" in t:
-                args.setdefault("date", (datetime.date.today() + datetime.timedelta(days=1)).isoformat())
-            elif "today" in t:
-                args.setdefault("date", datetime.date.today().isoformat())
+            # Date extraction — explicit dates (ISO, "July 17", bare "10th") win
+            # over vague tomorrow/today keywords. Otherwise a correction like
+            # "not today, I want the 10th" would match "today" as a substring
+            # and never even look for the actual date the user asked for.
+            # NOTE: these overwrite (not setdefault) any date the LLM produced —
+            # Qwen3 has no reliable sense of the real current date/year and has
+            # been observed hallucinating stale years (e.g. "2023") even when
+            # told the correct day/month, so the deterministic parser always wins.
+            dm = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', text)
+            if dm:
+                args["date"] = dm.group(1)
             else:
-                dm = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', text)
-                if dm:
-                    args.setdefault("date", dm.group(1))
-                else:
-                    nd = _parse_natural_date(text)
-                    if nd:
-                        args.setdefault("date", nd)
+                nd = _parse_natural_date(text)
+                if nd:
+                    args["date"] = nd
+                elif "tomorrow" in t:
+                    args["date"] = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+                elif "today" in t:
+                    args["date"] = datetime.date.today().isoformat()
         result["args"] = args
         return result
 

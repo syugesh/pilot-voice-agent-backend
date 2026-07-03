@@ -1,2 +1,9 @@
 .env
 pilot.db
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+data/ppt/*.pptx
+data/ppt/slides/
+data/pilot.db-*

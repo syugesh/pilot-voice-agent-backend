@@ -17,7 +17,11 @@ logger = logging.getLogger("pilot.silero")
 # ── Tuning knobs ──────────────────────────────────────────────────────────────
 SPEECH_PROB_THRESHOLD = 0.5    # Silero probability to count a frame as speech
 ENERGY_FALLBACK_RMS   = 500    # RMS used if neural model didn't load
-SILENCE_FRAMES_TO_END = 15     # 15 × 32ms = 480ms silence → end turn
+SILENCE_FRAMES_TO_END = 9      # 9 × 32ms = 288ms silence → end turn
+                                # (was 480ms — too long a gap let back-to-back
+                                # different speakers get merged into one turn,
+                                # so diarization/identification only ever saw
+                                # one blended speaker label for both people)
 MIN_SPEECH_FRAMES     = 10     # 10 × 32ms = 320ms minimum speech to emit
 MAX_TURN_SECONDS      = 12.0   # hard cap
 MIN_AVG_PROB          = 0.45   # whole-turn average speech-prob gate (neural mode)

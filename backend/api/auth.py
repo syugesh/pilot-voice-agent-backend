@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, Cookie
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Cookie, Header
 from fastapi.responses import RedirectResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -51,6 +51,12 @@ class OtpVerifyReq(BaseModel):
 
 class OtpSendReq(BaseModel):
     email: EmailStr
+
+class ForgotPasswordReq(BaseModel):
+    email: EmailStr
+
+class ResetPasswordReq(BaseModel):
+    email: EmailStr; otp: str; new_password: str
 
 
 @router.post("/signup")
@@ -160,6 +166,11 @@ async def verify_otp(request: Request, response: Response, req: OtpVerifyReq, db
 @limiter.limit("5/minute")
 async def login(request: Request, response: Response, req: LoginReq, db: AsyncSession = Depends(get_db)):
     user = (await db.execute(select(User).where(User.email == req.email))).scalar_one_or_none()
+    if user and user.oauth_provider:
+        # SSO accounts get a random, unknowable password hash at signup — password
+        # login can never succeed for them, so say why instead of "Invalid credentials".
+        provider = user.oauth_provider.title()
+        raise HTTPException(401, f"This account uses {provider} Sign-In. Use 'Continue with {provider}' instead of a password.")
     if not user or not verify_password(req.password, user.hashed_pw):
         raise HTTPException(401, "Invalid credentials")
     if not user.is_active:
@@ -177,6 +188,39 @@ async def login(request: Request, response: Response, req: LoginReq, db: AsyncSe
     return {"access_token": token, "token_type": "bearer",
             "voice_enrolled": ve is not None,
             "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role}}
+
+
+@router.post("/forgot-password")
+@limiter.limit("3/minute")
+async def forgot_password(request: Request, req: ForgotPasswordReq, db: AsyncSession = Depends(get_db)):
+    """Send a reset code to the account's email, reusing the same otp/otp_expiry
+    columns as signup verification. Response is identical whether or not the
+    account exists, so this endpoint can't be used to enumerate registered emails."""
+    user = (await db.execute(select(User).where(User.email == req.email))).scalar_one_or_none()
+    if user and user.is_active:
+        otp = gen_otp()
+        user.otp        = otp
+        user.otp_expiry = datetime.utcnow() + timedelta(minutes=10)
+        await db.commit()
+        await _send_otp(req.email, otp)
+    return {"message": "If that email is registered, a reset code has been sent."}
+
+
+@router.post("/reset-password")
+@limiter.limit("5/minute")
+async def reset_password(request: Request, req: ResetPasswordReq, db: AsyncSession = Depends(get_db)):
+    user = (await db.execute(select(User).where(User.email == req.email))).scalar_one_or_none()
+    if not user or not user.otp or user.otp != req.otp:
+        raise HTTPException(400, "Invalid or expired code")
+    if not user.otp_expiry or datetime.utcnow() > user.otp_expiry:
+        raise HTTPException(400, "Code expired — request a new one")
+    if len(req.new_password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    user.hashed_pw  = hash_password(req.new_password)
+    user.otp        = None
+    user.otp_expiry = None
+    await db.commit()
+    return {"message": "Password reset successful. Please sign in."}
 
 
 @router.post("/refresh")
@@ -313,11 +357,12 @@ async def sso_google_callback(code: str, state: str, db: AsyncSession = Depends(
 
     # Find or create user
     user = (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
+    is_new_user = user is None
     if not user:
         user = User(
             name=name, email=email,
             hashed_pw=hash_password(str(uuid.uuid4())),  # random — SSO users never use password login
-            role="developer",
+            role="developer",  # placeholder — frontend prompts to choose a real role right after redirect
             oauth_provider="google", oauth_id=g_id,
             is_active=True,
         )
@@ -352,5 +397,37 @@ async def sso_google_callback(code: str, state: str, db: AsyncSession = Depends(
         f"?sso_token={jwt}"
         f"&sso_user={user_b64}"
         f"&voice_enrolled={'1' if ve else '0'}"
+        f"&new_user={'1' if is_new_user else '0'}"
     )
     return RedirectResponse(redirect)
+
+
+class ChooseRoleReq(BaseModel):
+    role: str
+
+
+@router.patch("/role")
+async def choose_role(req: ChooseRoleReq, authorization: str | None = Header(None),
+                       db: AsyncSession = Depends(get_db)):
+    """Lets a brand-new SSO signup pick their real role — SSO has no signup form,
+    so accounts are created with a 'developer' placeholder that this replaces."""
+    valid_roles = {"developer", "manager", "csr", "operator", "admin"}
+    if req.role not in valid_roles:
+        raise HTTPException(400, f"Invalid role. Must be one of: {', '.join(sorted(valid_roles))}")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Login required")
+    try:
+        payload = decode_token(authorization.split(" ", 1)[1])
+        user_id = int(payload["sub"])
+    except Exception:
+        raise HTTPException(401, "Invalid or expired token")
+
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(404, "User not found")
+    user.role = req.role
+    await db.commit()
+
+    new_token = create_token({"sub": str(user.id), "email": user.email, "role": user.role})
+    return {"access_token": new_token, "token_type": "bearer",
+            "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role}}

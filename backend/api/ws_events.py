@@ -13,6 +13,14 @@ logger = logging.getLogger("pilot.ws.events")
 _session_queues: dict[str, list[asyncio.Queue]] = {}
 _route_task: asyncio.Task | None = None
 
+# Short replay buffer — bridges the ~2s window the frontend's auto-reconnect
+# takes to re-establish the socket. Without this, any event computed while
+# briefly disconnected (e.g. a slow tool call finishing mid-reconnect) had zero
+# registered listeners to route to and was silently dropped forever, even
+# though the client came back seconds later.
+_BACKLOG_MAXLEN = 20
+_session_backlog: dict[str, list] = {}
+
 
 @router.websocket("/ws/events/{session_id}")
 async def ws_events(websocket: WebSocket, session_id: str):
@@ -33,6 +41,12 @@ async def ws_events(websocket: WebSocket, session_id: str):
     local_q: asyncio.Queue = asyncio.Queue(maxsize=500)
     _session_queues.setdefault(session_id, []).append(local_q)
     drainer = asyncio.create_task(_drain(session_id, local_q))
+
+    # Replay anything that arrived while no connection was registered (e.g.
+    # during the brief gap of an auto-reconnect) before switching to live events.
+    backlog = _session_backlog.pop(session_id, [])
+    for event in backlog:
+        await broadcast(session_id, {"type": event.type, "payload": event.payload})
 
     try:
         while True:
@@ -75,6 +89,12 @@ async def route_events():
                 if event.session_id != "*"
                 else [q for qs in _session_queues.values() for q in qs]
             )
+            if not targets and event.session_id != "*":
+                # No live listener right now (e.g. client mid-reconnect) — hold
+                # onto it briefly so a reconnecting client doesn't lose it.
+                backlog = _session_backlog.setdefault(event.session_id, [])
+                backlog.append(event)
+                del backlog[:-_BACKLOG_MAXLEN]
             for q in targets:
                 try:
                     q.put_nowait(event)

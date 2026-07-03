@@ -110,6 +110,8 @@ class FrontLLMWorker:
                 "confidence": 1.0,
                 "timestamp":  time.time(),
             }, span.session_id)
+            from core.transcript_log import persist_pilot_reply
+            asyncio.create_task(persist_pilot_reply(span.session_id, decision.preamble))
             # Register task so stop words can cancel it mid-speech
             from core.cancel_tokens import register_tts
             tts_task = asyncio.create_task(_speak(decision.preamble, span.session_id))
@@ -232,6 +234,8 @@ async def _delegate(decision: RouteDecision):
             "text": denial, "speaker": "PILOT", "role": "assistant",
             "confidence": 1.0, "timestamp": __import__("time").time(),
         }, decision.session_id)
+        from core.transcript_log import persist_pilot_reply
+        asyncio.create_task(persist_pilot_reply(decision.session_id, denial))
         asyncio.create_task(_speak(denial, decision.session_id))
         return
 

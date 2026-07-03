@@ -64,7 +64,7 @@ class DiarizerWorker:
                 embedding, quality = await asyncio.wait_for(task, timeout=_WINDOW_TIMEOUT_S)
                 speaker_id, role, conf, msg = await identify_embedding(embedding, quality)
                 window_results.append((speaker_id, role, conf))
-                logger.debug(
+                logger.info(
                     f"[{seg.session_id[:8]}] window {win_idx} "
                     f"@{start_sec:.2f}s → {speaker_id!r} conf={conf:.2f}"
                 )

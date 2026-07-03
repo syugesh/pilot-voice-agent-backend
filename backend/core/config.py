@@ -1,5 +1,12 @@
 from pydantic_settings import BaseSettings
+from pathlib import Path
 from typing import Optional
+
+# Anchor .env lookup to this file's directory (backend/), not the process's
+# cwd — otherwise starting the server from a different working directory
+# silently skips .env entirely and falls back to in-code defaults, which
+# point at a different DB file (see db/engine.py for the matching fix).
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 class Settings(BaseSettings):
     # App
@@ -39,6 +46,13 @@ class Settings(BaseSettings):
 
     # Speaker identity
     COSINE_THRESHOLD: float = 0.75
+    # Minimum lead the best match must have over the runner-up to be trusted.
+    # Without this, two enrolled voices scoring e.g. 0.76 vs 0.78 (both above
+    # threshold) would silently pick the higher one with full confidence even
+    # though it's really a toss-up — this is how one speaker's turn ends up
+    # mislabeled with another enrolled speaker's name instead of falling back
+    # to "unidentified".
+    COSINE_MARGIN: float = 0.05
     EMBEDDING_DIM: int = 256  # WeSpeaker ECAPA-TDNN outputs 256-dim
 
     # Queue sizes (back-pressure)
@@ -67,6 +81,6 @@ class Settings(BaseSettings):
     EMAIL_FROM: str = "pilot@localhost"
 
     class Config:
-        env_file = ".env"
+        env_file = str(_ENV_FILE)
 
 settings = Settings()

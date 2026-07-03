@@ -3,10 +3,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from pydantic import BaseModel
 from db.engine import get_db
-from db.models import Session as PilotSession, TranscriptLog, AuditLog
+from db.models import Session as PilotSession, TranscriptLog, AuditLog, User
 import uuid
 
 router = APIRouter()
+
+# Summaries are only cached once a session has ENDED (immutable at that point) —
+# an in-progress session's summary would go stale, so those are always
+# regenerated fresh instead of cached.
+_summary_cache: dict[str, str] = {}
 
 
 class CreateSessionReq(BaseModel):
@@ -17,13 +22,12 @@ def _mask(session_id: str) -> str:
     return session_id[:8] if session_id else ""
 
 
-def _role_from_token(authorization: str | None) -> str | None:
+def _claims_from_token(authorization: str | None) -> dict | None:
     if not authorization or not authorization.startswith("Bearer "):
         return None
     try:
         from core.security import decode_token
-        payload = decode_token(authorization.split(" ", 1)[1])
-        return payload.get("role")
+        return decode_token(authorization.split(" ", 1)[1])
     except Exception:
         return None
 
@@ -37,10 +41,19 @@ async def create(req: CreateSessionReq, db: AsyncSession = Depends(get_db),
     from core.session_manager import session_manager
     from core.session_state import get_state
     session_manager.register(sid, 0, req.usecase)
-    # Store authenticated user's role so voice ID fallback uses correct permissions
-    role = _role_from_token(authorization)
-    if role:
-        get_state(sid).fallback_role = role
+    # Store authenticated user's role + name so voice ID fallback uses correct
+    # permissions and the transcript shows the real name instead of "You"
+    claims = _claims_from_token(authorization)
+    if claims:
+        state = get_state(sid)
+        if claims.get("role"):
+            state.fallback_role = claims["role"]
+        if claims.get("email"):
+            user = (await db.execute(
+                select(User).where(User.email == claims["email"])
+            )).scalar_one_or_none()
+            if user:
+                state.fallback_name = user.name
     return {"session_id": sid, "usecase": req.usecase, "state": "IDLE"}
 
 
@@ -83,6 +96,23 @@ async def session_history(session_id: str, db: AsyncSession = Depends(get_db)):
         .order_by(AuditLog.timestamp)
     )).scalars().all()
 
+    transcript_dicts = [
+        {"speaker": t.speaker_id, "role": t.role, "text": t.text, "timestamp": t.timestamp}
+        for t in transcripts
+    ]
+    action_dicts = [
+        {"tool": a.tool, "decision": a.decision, "latency_ms": a.latency_ms, "timestamp": a.timestamp}
+        for a in actions
+    ]
+
+    if s.state == "ENDED" and session_id in _summary_cache:
+        summary = _summary_cache[session_id]
+    else:
+        from services.session_summary import summarize_session
+        summary = await summarize_session(transcript_dicts, action_dicts, s.usecase)
+        if s.state == "ENDED":
+            _summary_cache[session_id] = summary
+
     return {
         "session": {
             "session_id":  s.session_id,
@@ -92,16 +122,9 @@ async def session_history(session_id: str, db: AsyncSession = Depends(get_db)):
             "created_at":  str(s.created_at),
             "ended_at":    str(s.ended_at) if s.ended_at else None,
         },
-        "transcripts": [
-            {"speaker": t.speaker_id, "role": t.role,
-             "text": t.text, "timestamp": t.timestamp}
-            for t in transcripts
-        ],
-        "actions": [
-            {"tool": a.tool, "decision": a.decision,
-             "latency_ms": a.latency_ms, "timestamp": a.timestamp}
-            for a in actions
-        ],
+        "summary":     summary,
+        "transcripts": transcript_dicts,
+        "actions":     action_dicts,
     }
 
 

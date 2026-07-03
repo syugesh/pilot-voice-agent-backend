@@ -2,16 +2,37 @@
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
 from core.config import settings
+from pathlib import Path
 import os
 
-os.makedirs("data", exist_ok=True)
+# Anchor relative sqlite paths to this file's directory (backend/), not the
+# process's cwd. DATABASE_URL is normally a relative path (./data/pilot.db),
+# and cwd depends on however the server happens to be launched — a different
+# terminal/IDE run config/script starting uvicorn from a different directory
+# silently created a brand-new empty DB file there instead of erroring, which
+# is why the "real" data/pilot.db looked empty on some runs.
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+_SQLITE_PREFIX = "sqlite+aiosqlite:///"
+
+
+def _resolve_database_url(url: str) -> str:
+    if url.startswith(_SQLITE_PREFIX):
+        raw_path = url[len(_SQLITE_PREFIX):]
+        if raw_path and not raw_path.startswith("/"):
+            return _SQLITE_PREFIX + str((_BACKEND_DIR / raw_path).resolve())
+    return url
+
+
+DATABASE_URL = _resolve_database_url(settings.DATABASE_URL)
+
+os.makedirs(_BACKEND_DIR / "data", exist_ok=True)
 
 
 class Base(DeclarativeBase):
     pass
 
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False)
+engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 

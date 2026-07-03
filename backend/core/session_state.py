@@ -19,6 +19,7 @@ class SessionPipelineState:
     tts_playing: bool = False
     usecase: str = "customercare"
     fallback_role: Optional[str] = None   # JWT-authenticated user role, used when voice ID fails
+    fallback_name: Optional[str] = None   # JWT-authenticated user's real name, used when voice ID fails
     # UI-provided overrides for travel search (set by frontend form, if present)
     typed_origin: Optional[str] = None
     typed_destination: Optional[str] = None

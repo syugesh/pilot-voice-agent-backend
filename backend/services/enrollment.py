@@ -163,7 +163,7 @@ async def identify_embedding(embedding: np.ndarray, quality: float) -> tuple[str
     if quality < 0.15:
         return None, None, quality, "Audio too quiet"
 
-    best_score, best_match = 0.0, None
+    best_score, best_match, second_score = 0.0, None, 0.0
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(
@@ -182,16 +182,32 @@ async def identify_embedding(embedding: np.ndarray, quality: float) -> tuple[str
             min_dim = min(len(stored), len(embedding))
             score = cosine_similarity(stored[:min_dim], embedding[:min_dim])
             if score > best_score:
+                second_score = best_score
                 best_score = score
                 best_match = row
+            elif score > second_score:
+                second_score = score
         except Exception as e:
             logger.error(f"Compare failed for {row.speaker_name}: {e}")
 
     threshold = settings.COSINE_THRESHOLD
-    if best_score >= threshold and best_match:
+    margin = settings.COSINE_MARGIN
+    if best_score >= threshold and best_match and (best_score - second_score) >= margin:
+        logger.info(
+            f"[window] identified: {best_match.speaker_name} {best_score:.3f} "
+            f"(runner-up={second_score:.3f})"
+        )
         return (best_match.speaker_name, best_match.role, best_score,
                 f"Confidence: {int(best_score*100)}%")
 
+    if best_score >= threshold and best_match:
+        logger.info(
+            f"[window] ambiguous: best={best_match.speaker_name} {best_score:.3f} "
+            f"vs runner-up {second_score:.3f} — margin too small, treating as unidentified"
+        )
+        return None, None, best_score, f"Ambiguous match ({int(best_score*100)}%) — too close to another enrolled voice"
+
+    logger.info(f"[window] no match: best={best_score:.3f} < threshold={threshold}")
     return None, None, best_score, f"Score too low ({int(best_score*100)}%)"
 
 
@@ -211,7 +227,7 @@ async def identify_speaker(pcm: bytes) -> tuple[str | None, str | None, float, s
     if quality < 0.15:
         return None, None, quality, "Audio too quiet — please speak louder"
 
-    best_score, best_match = 0.0, None
+    best_score, best_match, second_score = 0.0, None, 0.0
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(
@@ -231,18 +247,29 @@ async def identify_speaker(pcm: bytes) -> tuple[str | None, str | None, float, s
             min_dim = min(len(stored), len(embedding))
             score = cosine_similarity(stored[:min_dim], embedding[:min_dim])
             if score > best_score:
+                second_score = best_score
                 best_score = score
                 best_match = row
+            elif score > second_score:
+                second_score = score
         except Exception as e:
             logger.error(f"Compare failed for {row.speaker_name}: {e}")
 
     threshold = settings.COSINE_THRESHOLD
+    margin = settings.COSINE_MARGIN
 
-    if best_score >= threshold and best_match:
-        logger.info(f"Identified: {best_match.speaker_name} conf={best_score:.3f}")
+    if best_score >= threshold and best_match and (best_score - second_score) >= margin:
+        logger.info(f"Identified: {best_match.speaker_name} conf={best_score:.3f} (runner-up={second_score:.3f})")
         return (best_match.speaker_name, best_match.role, best_score,
                 f"Confidence: {int(best_score*100)}%")
 
+    if best_score >= threshold and best_match:
+        logger.info(
+            f"Ambiguous match: best={best_match.speaker_name} {best_score:.3f} "
+            f"vs runner-up {second_score:.3f} — margin too small, treating as unidentified"
+        )
+        return None, None, best_score, f"Ambiguous match ({int(best_score*100)}%) — too close to another enrolled voice"
+
     msg = f"Score too low ({int(best_score*100)}%) — please re-enroll or speak clearly"
-    logger.debug(f"Unknown speaker: best={best_score:.3f} < threshold={threshold}")
+    logger.info(f"Unknown speaker: best={best_score:.3f} < threshold={threshold}")
     return None, None, best_score, msg

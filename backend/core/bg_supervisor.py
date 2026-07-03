@@ -117,17 +117,22 @@ class BGSupervisor:
             except Exception as e:
                 logger.error(f"Audit log failed: {e}")
 
-            # spoken_reply semantics:
-            #   absent / None  → auto-generate via bg_agent + fallback
-            #   ""             → tool explicitly suppresses TTS (preamble already covered it)
-            #   "some text"    → speak exactly this
-            reply = result.get("spoken_reply", None)
+            # A cancelled job (barge-in / superseded by a newer interrupt-mode job)
+            # must stay silent — narrating "the tool was cancelled" back to the user
+            # is meaningless noise, not an answer. Skip reply synthesis entirely.
+            reply = None
+            if result.get("status") != "cancelled":
+                # spoken_reply semantics:
+                #   absent / None  → auto-generate via bg_agent + fallback
+                #   ""             → tool explicitly suppresses TTS (preamble already covered it)
+                #   "some text"    → speak exactly this
+                reply = result.get("spoken_reply", None)
 
-            if reply is None:
-                from services.bg_agent import generate_reply
-                reply = await generate_reply(job.tool, result)
                 if reply is None:
-                    reply = _fallback_reply(job.tool, result)
+                    from services.bg_agent import generate_reply
+                    reply = await generate_reply(job.tool, result)
+                    if reply is None:
+                        reply = _fallback_reply(job.tool, result)
 
             if reply:
                 # Reset barge_in flag immediately before compiling the new background answer.
@@ -167,7 +172,9 @@ class BGSupervisor:
                     "confidence": 1.0, "timestamp": time.time(),
                     "job_id": job.job_id,
                 }, job.session_id)
-                
+                from core.transcript_log import persist_pilot_reply
+                asyncio.create_task(persist_pilot_reply(job.session_id, final_text))
+
                 # Cancel any existing active TTS task cleanly (like an active preamble task still sleeping)
                 if state.active_tts_task and not state.active_tts_task.done():
                     state.active_tts_task.cancel()
@@ -175,7 +182,7 @@ class BGSupervisor:
                     
                 task = asyncio.create_task(_speak(reply, job.session_id))
                 state.active_tts_task = task
-            else:
+            elif result.get("status") != "cancelled":
                 await session_manager.transition(job.session_id, SessionState.LISTENING)
                 # If there's no spoken reply, emit a fallback transcript event with job_id to complete the task card
                 await bus.emit_event("transcript", {
@@ -183,6 +190,10 @@ class BGSupervisor:
                     "confidence": 1.0, "timestamp": time.time(),
                     "job_id": job.job_id,
                 }, job.session_id)
+                from core.transcript_log import persist_pilot_reply
+                asyncio.create_task(persist_pilot_reply(job.session_id, f"✓ {job.tool} task executed."))
+            else:
+                await session_manager.transition(job.session_id, SessionState.LISTENING)
 
 
 async def _speak(text: str, session_id: str):
