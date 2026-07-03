@@ -57,22 +57,44 @@ async def create(req: CreateSessionReq, db: AsyncSession = Depends(get_db),
     return {"session_id": sid, "usecase": req.usecase, "state": "IDLE"}
 
 
+_USECASE_LABELS = {"ppt": "Presentation", "customercare": "Customer Care", "general": "General"}
+
+
+def _make_title(usecase: str, first_line: str | None) -> str:
+    """A random session_id/UUID means nothing to a user browsing their history —
+    title the session by what was actually first said in it instead, the same
+    way chat apps title conversations by their opening message."""
+    label = _USECASE_LABELS.get(usecase, usecase.title() if usecase else "Session")
+    if not first_line:
+        return f"New {label} Session"
+    text = first_line.strip()
+    return (text[:57] + "…") if len(text) > 57 else text
+
+
 @router.get("/list")
 async def list_sessions(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(PilotSession).order_by(desc(PilotSession.id)).limit(20)
     )
     rows = result.scalars().all()
-    return {"sessions": [
-        {
+
+    sessions = []
+    for s in rows:
+        first = (await db.execute(
+            select(TranscriptLog.text)
+            .where(TranscriptLog.session_id == s.session_id, TranscriptLog.speaker_id != "PILOT")
+            .order_by(TranscriptLog.timestamp)
+            .limit(1)
+        )).scalar_one_or_none()
+        sessions.append({
             "session_id":  s.session_id,
             "display_id":  _mask(s.session_id),
+            "title":       _make_title(s.usecase, first),
             "usecase":     s.usecase,
             "state":       s.state,
             "created_at":  str(s.created_at),
-        }
-        for s in rows
-    ]}
+        })
+    return {"sessions": sessions}
 
 
 @router.get("/{session_id}/history")

@@ -6,7 +6,7 @@ from slowapi.util import get_remote_address
 limiter = Limiter(key_func=get_remote_address)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from datetime import datetime, timedelta
 import asyncio
 import logging
@@ -40,22 +40,36 @@ _sso_states: dict[str, bool] = {}
 _pending: dict[str, dict] = {}  # email → {name, hashed_pw, role, otp, otp_expiry}
 
 
-class SignupReq(BaseModel):
+class _NormalizedEmail(BaseModel):
+    """
+    Lowercases + strips email on every request model that has one. Without
+    this, "Deepak@Gmail.com" at signup and "deepak@gmail.com" at login are
+    different strings to a plain SQL `=` comparison — the account exists,
+    the password is correct, but the lookup finds no row and login fails
+    with a misleading "Invalid credentials".
+    """
+    @field_validator("email", mode="before", check_fields=False)
+    @classmethod
+    def _normalize_email(cls, v):
+        return v.strip().lower() if isinstance(v, str) else v
+
+
+class SignupReq(_NormalizedEmail):
     name: str; email: EmailStr; password: str; role: str = "developer"
 
-class LoginReq(BaseModel):
+class LoginReq(_NormalizedEmail):
     email: EmailStr; password: str
 
-class OtpVerifyReq(BaseModel):
+class OtpVerifyReq(_NormalizedEmail):
     email: EmailStr; otp: str
 
-class OtpSendReq(BaseModel):
+class OtpSendReq(_NormalizedEmail):
     email: EmailStr
 
-class ForgotPasswordReq(BaseModel):
+class ForgotPasswordReq(_NormalizedEmail):
     email: EmailStr
 
-class ResetPasswordReq(BaseModel):
+class ResetPasswordReq(_NormalizedEmail):
     email: EmailStr; otp: str; new_password: str
 
 
@@ -348,7 +362,7 @@ async def sso_google_callback(code: str, state: str, db: AsyncSession = Depends(
             raise HTTPException(400, "Failed to fetch Google profile")
         g = prof_res.json()
 
-    email   = g.get("email", "")
+    email   = g.get("email", "").strip().lower()
     name    = g.get("name") or email.split("@")[0]
     g_id    = g.get("id", "")
 

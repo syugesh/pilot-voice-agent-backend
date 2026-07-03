@@ -13,9 +13,36 @@ If below COSINE_THRESHOLD, identify_speaker returns confidence + message.
 import numpy as np
 import asyncio
 import logging
+import subprocess
 from core.config import settings
 
 logger = logging.getLogger("pilot.enrollment")
+
+
+def _decode_to_pcm16(audio_bytes: bytes) -> bytes:
+    """
+    Decode browser-recorded audio (webm/opus from MediaRecorder, wav, etc.)
+    into raw 16kHz mono PCM16 via ffmpeg.
+
+    Enrollment audio arrives as a compressed webm/opus blob, but was
+    previously fed straight into WeSpeaker — which expects raw PCM16
+    samples — with no decoding step at all. That meant every enrollment
+    was extracting an "embedding" from raw container/codec bytes reinterpreted
+    as int16 samples, not from anyone's actual voice. Those bytes are
+    structurally similar across recordings regardless of speaker (same
+    container format, same codec framing), which is why every enrolled
+    voiceprint ended up looking nearly identical to every other one. The
+    live /ws/audio path was never affected — the browser streams genuine
+    raw PCM there, not webm.
+    """
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error",
+         "-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1"],
+        input=audio_bytes, capture_output=True,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        raise RuntimeError(f"ffmpeg decode failed: {proc.stderr.decode(errors='ignore')[:300]}")
+    return proc.stdout
 
 
 class WeSpeakerEmbedProvider:
@@ -138,7 +165,8 @@ async def extract_and_store(speaker_id: int, audio_bytes: bytes) -> tuple[bytes,
     Returns (embedding_bytes, quality_score).
     """
     await asyncio.to_thread(_lazy_load)
-    embedding, quality = await asyncio.to_thread(embed_provider.extract, audio_bytes)
+    pcm = await asyncio.to_thread(_decode_to_pcm16, audio_bytes)
+    embedding, quality = await asyncio.to_thread(embed_provider.extract, pcm)
     logger.info(f"Enrollment: speaker_id={speaker_id} dim={embedding.shape} quality={quality:.2f}")
     return embedding.tobytes(), quality
 
@@ -207,7 +235,8 @@ async def identify_embedding(embedding: np.ndarray, quality: float) -> tuple[str
         )
         return None, None, best_score, f"Ambiguous match ({int(best_score*100)}%) — too close to another enrolled voice"
 
-    logger.info(f"[window] no match: best={best_score:.3f} < threshold={threshold}")
+    closest = best_match.speaker_name if best_match else "nobody enrolled"
+    logger.info(f"[window] no match: closest={closest} best={best_score:.3f} < threshold={threshold}")
     return None, None, best_score, f"Score too low ({int(best_score*100)}%)"
 
 
@@ -271,5 +300,6 @@ async def identify_speaker(pcm: bytes) -> tuple[str | None, str | None, float, s
         return None, None, best_score, f"Ambiguous match ({int(best_score*100)}%) — too close to another enrolled voice"
 
     msg = f"Score too low ({int(best_score*100)}%) — please re-enroll or speak clearly"
-    logger.info(f"Unknown speaker: best={best_score:.3f} < threshold={threshold}")
+    closest = best_match.speaker_name if best_match else "nobody enrolled"
+    logger.info(f"Unknown speaker: closest={closest} best={best_score:.3f} < threshold={threshold}")
     return None, None, best_score, msg

@@ -21,7 +21,6 @@ class Settings(BaseSettings):
     # Providers — swap via .env
     ASR_PROVIDER: str = "whisper"
     TTS_PROVIDER: str = "edge_tts"
-    DIAR_PROVIDER: str = "pyannote"
     EMBED_PROVIDER: str = "wespeaker"
     FRONT_LLM_PROVIDER: str = "ollama"
     BG_LLM_PROVIDER: str = "gemini"
@@ -45,7 +44,14 @@ class Settings(BaseSettings):
 
 
     # Speaker identity
-    COSINE_THRESHOLD: float = 0.75
+    # 0.75 was calibrated for clean, quiet conditions. Real conversational audio
+    # (background noise, mic distance, different session than enrollment) pushed
+    # genuine same-person scores down to ~0.6-0.7 — consistently below 0.75 even
+    # for a correctly enrolled speaker matching themselves — while different real
+    # people compared far lower still (~0.03-0.17). 0.6 sits well above that
+    # cross-person baseline while actually being reachable for real same-person
+    # matches; COSINE_MARGIN below still guards against near-tie confusion.
+    COSINE_THRESHOLD: float = 0.6
     # Minimum lead the best match must have over the runner-up to be trusted.
     # Without this, two enrolled voices scoring e.g. 0.76 vs 0.78 (both above
     # threshold) would silently pick the higher one with full confidence even

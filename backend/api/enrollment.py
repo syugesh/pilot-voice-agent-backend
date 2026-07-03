@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
 from db.engine import get_db
-from db.models import VoiceEnrollment
+from db.models import VoiceEnrollment, User
 from core.security import decode_token
 import asyncio, logging
 
@@ -24,20 +24,31 @@ class StartReq(BaseModel):
     role: str
 
 
-def _current_user_id(authorization: str | None) -> int | None:
-    """Decode the bearer token to find which user is enrolling. Without this,
-    enrollments are orphaned (user_id=None) and login can never see them as enrolled."""
+async def _current_user(authorization: str | None, db: AsyncSession) -> User:
+    """
+    Decode the bearer token and load the authenticated user's own DB row.
+    Every enrollment mutation must go through this — role and speaker_name
+    are taken from here (the authoritative account record), never from
+    client-supplied request fields, so a caller can't self-assign a role
+    like "admin" that they don't actually hold on their account.
+    """
     if not authorization or not authorization.startswith("Bearer "):
-        return None
+        raise HTTPException(401, "Login required before voice enrollment")
     try:
         payload = decode_token(authorization.removeprefix("Bearer ").strip())
-        return int(payload["sub"])
+        user_id = int(payload["sub"])
     except Exception:
-        return None
+        raise HTTPException(401, "Invalid or expired session")
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(401, "Account no longer exists")
+    return user
 
 
 @router.get("")
-async def list_speakers(db: AsyncSession = Depends(get_db)):
+async def list_speakers(db: AsyncSession = Depends(get_db),
+                         authorization: str | None = Header(None)):
+    await _current_user(authorization, db)   # any authenticated user may view the roster
     rows = (await db.execute(
         select(VoiceEnrollment).where(VoiceEnrollment.status == "ready")
     )).scalars().all()
@@ -48,24 +59,24 @@ async def list_speakers(db: AsyncSession = Depends(get_db)):
 @router.post("/start")
 async def start(req: StartReq, db: AsyncSession = Depends(get_db),
                  authorization: str | None = Header(None)):
-    user_id = _current_user_id(authorization)
-    if user_id is None:
-        raise HTTPException(401, "Login required before voice enrollment")
+    user = await _current_user(authorization, db)
 
-    # Re-enrolling: reuse this user's prior row instead of creating a duplicate
+    # Re-enrolling: reuse this user's prior row instead of creating a duplicate.
+    # speaker_name/role always come from the account record, not the request
+    # body — req.name/req.role are accepted for API compatibility but ignored.
     e = (await db.execute(
-        select(VoiceEnrollment).where(VoiceEnrollment.user_id == user_id)
+        select(VoiceEnrollment).where(VoiceEnrollment.user_id == user.id)
     )).scalar_one_or_none()
     if e is None:
-        e = VoiceEnrollment(user_id=user_id, speaker_name=req.name, role=req.role)
+        e = VoiceEnrollment(user_id=user.id, speaker_name=user.name, role=user.role)
         db.add(e)
     else:
-        e.speaker_name = req.name
-        e.role = req.role
+        e.speaker_name = user.name
+        e.role = user.role
         e.status = "pending"
     await db.commit()
     await db.refresh(e)
-    return {"speaker_id": e.id, "name": req.name, "role": req.role}
+    return {"speaker_id": e.id, "name": user.name, "role": user.role}
 
 
 @router.post("/audio")
@@ -74,14 +85,23 @@ async def submit_audio(
     request: Request,
     speaker_id: str = Form(...),
     audio: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(None),
 ):
     """Accepts both mic recordings (webm/wav) and uploaded audio files."""
+    user = await _current_user(authorization, db)
+
     e = (await db.execute(
         select(VoiceEnrollment).where(VoiceEnrollment.id == int(speaker_id))
     )).scalar_one_or_none()
     if not e:
         raise HTTPException(404, "Enrollment not found")
+    if e.user_id != user.id:
+        # Without this, anyone could POST audio against any other user's
+        # speaker_id and silently overwrite their stored voiceprint with
+        # their own — a full identity-takeover vector, since whoever's
+        # voice is stored there is who future turns get attributed to.
+        raise HTTPException(403, "You can only enroll your own voice")
 
     audio_bytes = await audio.read()
     if len(audio_bytes) < 1000:
@@ -101,23 +121,31 @@ async def submit_audio(
 
 
 @router.post("/finalize/{speaker_id}")
-async def finalize(speaker_id: int, db: AsyncSession = Depends(get_db)):
+async def finalize(speaker_id: int, db: AsyncSession = Depends(get_db),
+                    authorization: str | None = Header(None)):
+    user = await _current_user(authorization, db)
     e = (await db.execute(
         select(VoiceEnrollment).where(VoiceEnrollment.id == speaker_id)
     )).scalar_one_or_none()
     if not e:
         raise HTTPException(404)
+    if e.user_id != user.id:
+        raise HTTPException(403, "You can only finalize your own enrollment")
     e.status = "ready"
     await db.commit()
     return {"status": "ready", "voice_id": f"#{speaker_id:06X}"}
 
 
 @router.delete("/{speaker_id}")
-async def delete(speaker_id: int, db: AsyncSession = Depends(get_db)):
+async def delete(speaker_id: int, db: AsyncSession = Depends(get_db),
+                  authorization: str | None = Header(None)):
+    user = await _current_user(authorization, db)
     e = (await db.execute(
         select(VoiceEnrollment).where(VoiceEnrollment.id == speaker_id)
     )).scalar_one_or_none()
     if e:
+        if e.user_id != user.id and user.role != "admin":
+            raise HTTPException(403, "You can only delete your own enrollment")
         await db.delete(e)
         await db.commit()
     return {"status": "deleted"}
