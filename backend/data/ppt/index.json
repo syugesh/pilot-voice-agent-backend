@@ -1,5 +1,26 @@
 [
   {
+    "session_id": "anon-mr4p94wb-4omh1copor2",
+    "title": "Understanding Neural Networks",
+    "description": "create a presentation on neural networks",
+    "slide_count": 7,
+    "created_at": "2026-07-09T15:22:51"
+  },
+  {
+    "session_id": "e0f15b58-1585-477b-bb55-949d434ce8e8",
+    "title": "Getting Started with Machine Learning",
+    "description": "create a presentation on machine learning for beginners",
+    "slide_count": 7,
+    "created_at": "2026-07-09T14:52:14"
+  },
+  {
+    "session_id": "fb21e455-ae49-458a-8556-5508cfd18715",
+    "title": "Agentic AI: Empowering Intelligent Automation",
+    "description": "can you create a presentation on agentic AI",
+    "slide_count": 5,
+    "created_at": "2026-07-07T11:30:21"
+  },
+  {
     "session_id": "4f35317f-65e0-4f29-baa2-a6baee2fcc82",
     "title": "Introduction to Machine Learning for Beginners",
     "description": "create a presentation on machine learning for beginners",

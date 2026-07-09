@@ -16,11 +16,14 @@ logger = logging.getLogger("pilot.asr")
 WAKE_WORDS = [
     "hey pilot",    "hi pilot",    "ok pilot",    "okay pilot",  "yo pilot",
     "hey jarvis",   "jarvis",
-    "hey copilot",  "copilot",
+    "hey copilot",
     "pilot activate", "pilot help", "pilot listen",
     "hey there",
     "wake up",
-    "pilot",
+    # NOTE: bare "pilot" / "copilot" were removed — the app itself has a page
+    # named "PPT Copilot", so a bare single-word match false-triggered on any
+    # sentence that mentioned the product's own name (e.g. "open PPT copilot"),
+    # discarding everything before it and leaving only a meaningless remainder.
 ]
 WAKE_WORDS_SORTED = sorted(WAKE_WORDS, key=len, reverse=True)
 
@@ -33,12 +36,31 @@ MAX_BUFFER_CHARS  = 200   # force-flush if combined buffered text exceeds this l
 
 
 def _check_wake(text: str) -> tuple[bool, str]:
-    t = text.lower().strip()
+    """
+    A wake phrase only counts if it's spoken as a lead-in within the first few
+    words of the utterance ("Hey Pilot, open the dashboard"). The previous
+    implementation did a bare substring search over the whole sentence, which
+    matched "pilot"/"copilot" anywhere they appeared — including inside the
+    app's own vocabulary ("PPT Copilot", "co-pilot"). That silently discarded
+    everything before the match and routed only the trailing fragment (e.g.
+    "open PPT copilot" -> remainder "") as the actual command, so sentences
+    that legitimately mention the product name never reached the classifier
+    intact.
+    """
+    import re as _re
+    orig_words = text.split()
+    # Strip punctuation from each word individually (not just the string's
+    # ends) — "hey pilot, take me..." must still match "hey pilot" even though
+    # Whisper attaches the comma to the token.
+    lower_words = [_re.sub(r'^\W+|\W+$', '', w.lower()) for w in orig_words]
+    lead_in = lower_words[:4]
     for w in WAKE_WORDS_SORTED:
-        if w in t:
-            idx = t.find(w) + len(w)
-            remainder = text[idx:].strip(" ,.-!")
-            return True, remainder
+        w_words = w.split()
+        n = len(w_words)
+        for start in range(0, max(0, len(lead_in) - n + 1)):
+            if lead_in[start:start + n] == w_words:
+                remainder = " ".join(orig_words[start + n:]).strip(" ,.-!")
+                return True, remainder
     return False, text
 
 

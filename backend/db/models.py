@@ -90,3 +90,14 @@ class AuditLog(Base):
     detail      = Column(Text, nullable=True)
     latency_ms  = Column(Float, nullable=True)
     timestamp   = Column(DateTime, server_default=func.now())
+
+
+class PPTSlideVersion(Base):
+    __tablename__ = "ppt_slide_versions"
+    id          = Column(Integer, primary_key=True)
+    session_id  = Column(String, index=True, nullable=False)
+    slide_index = Column(Integer, nullable=False)
+    title       = Column(Text, nullable=True)
+    bullets     = Column(Text, nullable=True)  # JSON-encoded list of strings
+    notes       = Column(Text, nullable=True)
+    created_at  = Column(DateTime, server_default=func.now())

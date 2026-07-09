@@ -24,6 +24,7 @@ class SessionPipelineState:
     typed_origin: Optional[str] = None
     typed_destination: Optional[str] = None
     typed_date: Optional[str] = None
+    last_ppt_action: Optional[dict] = None
     active_tts_task: Optional[Any] = field(default=None, repr=False)
     tts_start_time: float = 0.0
 
@@ -39,6 +40,7 @@ class SessionPipelineState:
             "current_speaker": self.current_speaker,
             "current_role": self.current_role,
             "usecase": self.usecase,
+            "last_ppt_action": self.last_ppt_action,
         })
 
     @classmethod
@@ -49,6 +51,7 @@ class SessionPipelineState:
         s.current_speaker = data.get("current_speaker")
         s.current_role = data.get("current_role")
         s.usecase = data.get("usecase", "customercare")
+        s.last_ppt_action = data.get("last_ppt_action")
         return s
 
 

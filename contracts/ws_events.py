@@ -19,6 +19,7 @@ class WSEvent:
 # job_queued        → {job_id, tool, requester, mode}
 # confirm_prompt    → {tool, speaker, message}
 # ppt_command       → {action, index?}
+# navigate_page     → {page}
 # tts_audio         → {chunk: number[]}
 # tts_stop          → {}
 # tool_blocked      → {tool, speaker, reason}

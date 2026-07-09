@@ -10,8 +10,19 @@ Usage:
     complete, confidence = smart_turn.check("and next I want to walk through")
     # → (False, 0.84)  — speaker hasn't finished yet
 """
-import logging
+import logging, re
 logger = logging.getLogger("pilot.smart_turn")
+
+# An edit-style command with a dangling "from X" and no "to Y" yet is still
+# mid-instruction ("change the title of slide 1 from Agentic AI to ___") even
+# if Whisper stamped a trailing period on it — Whisper punctuates on acoustic
+# pauses, not grammatical completeness, and a speaker pausing before dictating
+# the replacement value is exactly when that false period shows up. Without
+# this check, the end-punctuation rule below fires immediately, dispatching
+# the instruction before the new value was even spoken, and the value itself
+# then arrives as a disconnected, out-of-context second turn.
+_EDIT_VERB_RE     = re.compile(r'\b(?:change|edit|update|rename|rewrite|set)\b', re.IGNORECASE)
+_DANGLING_FROM_RE = re.compile(r'\bfrom\b(?!.*\bto\b)', re.IGNORECASE)
 
 # Words that almost always indicate an incomplete turn when they're the last word
 _INCOMPLETE_TAIL = {
@@ -38,6 +49,10 @@ def _heuristic(text: str) -> tuple[bool, float]:
         return True, 1.0
 
     tl = t.lower()
+
+    # Check before the end-punctuation rule below — see comment on the regexes.
+    if _EDIT_VERB_RE.search(tl) and _DANGLING_FROM_RE.search(tl):
+        return False, 0.75
 
     # Explicit end punctuation → almost certainly done
     if tl[-1] in ".!?":

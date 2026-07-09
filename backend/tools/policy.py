@@ -10,13 +10,13 @@ logger = logging.getLogger("pilot.policy")
 
 ROLE_PERMS = {
     "admin":     set(["*"]),
-    "manager":   {"ppt_navigate","ppt_jump_to_title","ppt_summarize","ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","flight_search","flight_book","general_qa"},
-    "csr":       {"ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","flight_search","flight_book","general_qa"},
-    "operator":  {"ppt_navigate","ppt_jump_to_title","ppt_summarize","general_qa"},
-    "developer": {"ppt_navigate","ppt_jump_to_title","ppt_summarize","kb_search","general_qa"},
+    "manager":   {"ppt_navigate","ppt_jump_to_title","ppt_summarize","ppt_edit_slide","ppt_generate_notes","ppt_last_action","ppt_add_slide","ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","travel_search","flight_book","general_qa","navigate_page"},
+    "csr":       {"ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","travel_search","flight_book","general_qa","navigate_page"},
+    "operator":  {"ppt_navigate","ppt_jump_to_title","ppt_summarize","ppt_edit_slide","ppt_generate_notes","ppt_last_action","ppt_add_slide","general_qa","navigate_page"},
+    "developer": {"ppt_navigate","ppt_jump_to_title","ppt_summarize","ppt_edit_slide","ppt_generate_notes","ppt_last_action","ppt_add_slide","kb_search","general_qa","navigate_page"},
     # "user" and "guest" = unrecognized/unenrolled speakers — allow basic navigation
-    "user":      {"ppt_navigate","ppt_jump_to_title","ppt_summarize","kb_search","general_qa","flight_search","flight_book"},
-    "guest":     {"ppt_navigate","ppt_jump_to_title","ppt_summarize","general_qa","flight_search"},
+    "user":      {"ppt_navigate","ppt_jump_to_title","ppt_summarize","ppt_edit_slide","ppt_generate_notes","ppt_last_action","ppt_add_slide","kb_search","general_qa","travel_search","flight_book","navigate_page"},
+    "guest":     {"ppt_navigate","ppt_jump_to_title","ppt_summarize","ppt_edit_slide","ppt_generate_notes","ppt_last_action","ppt_add_slide","general_qa","travel_search","navigate_page"},
     "customer":  set(),
 }
 

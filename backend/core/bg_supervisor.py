@@ -29,13 +29,14 @@ def _fallback_reply(tool: str, result: dict) -> Optional[str]:
             return "I searched but didn't find anything relevant. Could you rephrase?"
         first = items[0].get("excerpt","")[:120]
         return f"Found {len(items)} result{'s' if len(items)>1 else ''}. {first}"
-    if tool == "flight_search":
-        flights = result.get("flights", [])
-        if not flights:
-            return "No flights found for those details. Want to try different dates?"
-        f = flights[0]
-        return (f"Found {len(flights)} options. Best is {f.get('airline','')} "
-                f"departing {f.get('dep','')} for {f.get('price','')}.")
+    if tool == "travel_search":
+        results = result.get("results", [])
+        if not results:
+            return "No options found for those details. Want to try different dates?"
+        r = results[0]
+        return (f"Found {len(results)} options. Best is "
+                f"{r.get('airline') or r.get('hotel') or r.get('operator','')} "
+                f"for {r.get('price','')}.")
     if tool == "flight_book":
         ref = result.get("booking_ref","")
         return f"Booked! Your reference is {ref}."

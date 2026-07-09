@@ -94,16 +94,32 @@ CRITICAL — DO NOT fake answers in preamble:
   GOOD: {"action":"delegate","preamble":"Let me explain that!","tool":"general_qa","args":{"query":"..."}}
 The preamble is just a brief acknowledgment. The tool produces the real answer.
 
-PPT TOOLS: ppt_navigate(direction:next|prev|first|last), ppt_jump_to_title(query,slide_number), ppt_summarize(), ppt_delete_slide(slide_number?)
+PPT TOOLS: ppt_navigate(direction:next|prev|first|last), ppt_jump_to_title(query,slide_number), ppt_summarize(), ppt_delete_slide(slide_number?), ppt_edit_slide(instruction), ppt_generate_notes(slide_number?, all?), ppt_add_slide(instruction)
 "delete slide 10" → ppt_delete_slide(slide_number=9)   "delete this slide" → ppt_delete_slide()
 NEVER route delete/remove commands to ppt_jump_to_title or ppt_navigate.
-CARE TOOLS: ticket_create, ticket_update, ticket_close, kb_search(query), crm_lookup, flight_search, flight_book
+Use ppt_add_slide when the user asks to add, insert, or create a NEW slide
+("add a slide about pricing", "insert a new slide", "create a slide for the
+team") — this ADDS to the presentation, unlike ppt_edit_slide which only
+changes an EXISTING slide's content. instruction = what the new slide
+should be about (the whole request works fine as-is).
+CARE TOOLS: ticket_create, ticket_update, ticket_close, kb_search(query), crm_lookup, travel_search, flight_book
+NAVIGATION: navigate_page(page: "dashboard"|"ppt"|"care"|"guidelines"|"about"|"profile"|"settings") — use when the user asks to go to, open, switch to, or be taken/redirected to one of the app's top-level pages (e.g. "take me to PPT Copilot", "open customer care", "go to the dashboard"). Never use for in-page requests like "go to slide 5".
 GENERAL: general_qa(query) — world knowledge, facts, concepts, definitions, science, "who is", "what is", "tell me", "explain", "how does", "why", "what does", "describe", "difference between"
 
 slide_number is 0-indexed: "go to slide 7" → slide_number=6
 Use ppt_summarize when user asks to summarize, overview, or describe the presentation.
+Use ppt_edit_slide when user asks to change, update, edit, or format the text on a slide.
+Use ppt_generate_notes when user asks to generate, create, or write speaker notes for a slide.
 Use general_qa for ANY factual or conceptual question — including questions about things shown on slides.
 Use kb_search ONLY for company-internal policies, procedures, or internal documents — NOT general world knowledge.
+Use travel_search for flights, hotels, or trains — it auto-detects which from
+the query (e.g. "find flights to Mumbai", "hotels in Goa", "trains from Delhi
+to Jaipur" all route here). Use flight_book only to book a specific flight
+by id — never for hotels or trains, which are search/display only.
+NEVER use travel_search for weather, current events, or any non-travel-booking
+question just because a city name is mentioned — "weather in Chennai" is
+general_qa, not travel_search. travel_search is ONLY for booking/searching a
+flight, hotel, or train to travel somewhere.
 """
 
 _QUESTION_STARTERS = {
@@ -112,6 +128,40 @@ _QUESTION_STARTERS = {
     "what are", "what is", "how does", "how do", "why does", "why is",
     "can you explain", "could you explain", "what does", "how can",
 }
+
+# ── Page navigation — deterministic, works regardless of usecase ────────────
+# A nav phrase ("go to PPT copilot") must always route to navigate_page even
+# from inside the PPT or Customer Care usecase, where the normal keyword
+# fallback would otherwise filter navigate_page out as "not one of my tools."
+_NAV_VERB_RE = re.compile(
+    r'\b(?:go to|open|switch to|take me to|navigate to|show me|redirect me to|'
+    r'redirect to|pull up|bring up)\b'
+)
+_PAGE_TARGETS: list[tuple[str, tuple[str, ...]]] = [
+    ("ppt",        ("ppt copilot", "powerpoint", "presentation page", "presentation copilot", " ppt ", " ppt")),
+    ("care",       ("customer care", "care page", "support page", "help desk", "travel planner")),
+    ("guidelines", ("guidelines", "operator manual", "help guide", "command reference")),
+    ("about",      ("about page", "about pilot", "about section")),
+    ("profile",    ("my profile", "profile page", "account page", " profile")),
+    ("settings",   ("settings page", "preferences", " settings")),
+    # Checked last — "dashboard"/"home" are common words, so only match once
+    # nothing more specific above has already matched.
+    ("dashboard",  ("main dashboard", "dashboard", "home page", "home screen")),
+]
+_PAGE_LABELS = {
+    "dashboard": "the Main Dashboard", "ppt": "PPT Copilot", "care": "Customer Care",
+    "guidelines": "Guidelines", "about": "the About page", "profile": "your Profile",
+    "settings": "Settings",
+}
+
+def _detect_navigate_page(text: str) -> str | None:
+    t = f" {text.lower().strip()} "
+    if not _NAV_VERB_RE.search(t):
+        return None
+    for page_id, phrases in _PAGE_TARGETS:
+        if any(p in t for p in phrases):
+            return page_id
+    return None
 
 
 def _fix_respond_now_questions(result: dict, text: str, usecase: str) -> dict:
@@ -153,6 +203,21 @@ def _fix_respond_now_questions(result: dict, text: str, usecase: str) -> dict:
     return result
 
 
+def _is_ppt_followup_question(text: str) -> bool:
+    t = text.lower().strip().rstrip("?.,!")
+    return bool(re.search(
+        r'\b(?:what happened|did you change|what did you change|was it changed|did it work|what was updated|what got updated)\b',
+        t,
+    ))
+
+
+def _extract_spoken_slide_number(text: str) -> int | None:
+    # ASR sometimes hears "slide" as "flight"; in PPT edit contexts, treat both
+    # as a slide reference so commands like "change the title of flight 3" still work.
+    m = re.search(r'\b(?:slide|flight)[s]?\s*(?:number|no\.?|#)?\s*(\d+)\b', text.lower())
+    return int(m.group(1)) - 1 if m else None
+
+
 _KEYWORDS = [
     (["next slide","go forward","advance","next one"],
      {"action":"delegate","preamble":"Moving forward!","tool":"ppt_navigate","args":{"direction":"next"},"mode":"queue"}),
@@ -176,8 +241,14 @@ _KEYWORDS = [
      {"action":"delegate","preamble":"Let me summarize the presentation for you!","tool":"ppt_summarize","args":{},"mode":"queue"}),
     (["delete slide","delete this slide","remove slide","remove this slide","delete current slide"],
      {"action":"delegate","preamble":None,"tool":"ppt_delete_slide","args":{},"mode":"queue"}),
-    (["book flight","find flight","search flight","fly to","flights from"],
-     {"action":"delegate","preamble":"Checking flights for you!","tool":"flight_search","args":{},"mode":"queue"}),
+    (["generate notes", "generate speaker notes", "write notes", "create speaker notes"],
+     {"action":"delegate","preamble":"Generating speaker notes!","tool":"ppt_generate_notes","args":{},"mode":"queue"}),
+    (["edit slide", "change the title", "update the bullet", "make the text", "format slide"],
+     {"action":"delegate","preamble":"Editing the slide!","tool":"ppt_edit_slide","args":{"instruction": "edit slide based on request"},"mode":"queue"}),
+    (["book flight","find flight","search flight","fly to","flights from",
+      "book hotel","find hotel","search hotel","hotel in","hotel near","hotels in",
+      "book train","find train","search train","train from","train to","trains from"],
+     {"action":"delegate","preamble":"Checking that for you!","tool":"travel_search","args":{},"mode":"queue"}),
     (["look up customer","find customer","customer details","crm"],
      {"action":"delegate","preamble":"Looking up that customer.","tool":"crm_lookup","args":{},"mode":"queue"}),
 ]
@@ -219,10 +290,24 @@ def clear_memory(session_id: str) -> None:
 
 # ── Sync Ollama call (run in thread, same pattern as core/llm.py) ────────────
 
+_ollama_client = None
+
+def _get_ollama_client():
+    # A bounded-timeout client, not the bare ollama.chat() convenience function —
+    # that uses a default client with NO request timeout, so a slow/degraded
+    # Ollama (e.g. under system memory pressure) hangs classify() indefinitely
+    # instead of failing fast into the deterministic keyword fallback.
+    global _ollama_client
+    if _ollama_client is None:
+        import ollama
+        _ollama_client = ollama.Client(host=settings.OLLAMA_BASE_URL, timeout=settings.OLLAMA_TIMEOUT_S)
+    return _ollama_client
+
+
 def _ollama_chat_sync(messages: list[dict]) -> str:
     """Blocking ollama.chat() — called via asyncio.to_thread() to avoid blocking the loop."""
-    import ollama
-    response = ollama.chat(
+    client = _get_ollama_client()
+    response = client.chat(
         model=settings.OLLAMA_MODEL,
         messages=messages,
         think=False,               # disable Qwen3 thinking — cuts ~50s off latency
@@ -261,13 +346,67 @@ class FrontLLMProvider:
     async def classify(self, text: str, speaker_id: str, role: str,
                        context: list, usecase: str = "general",
                        session_id: str = "") -> dict:
+        # Page navigation — checked before anything usecase-specific so "go to
+        # customer care" works from the PPT page and vice versa, not just from
+        # whichever usecase's tool list happens to include navigate_page.
+        nav_page = _detect_navigate_page(text)
+        if nav_page:
+            return {"action": "delegate", "preamble": f"Opening {_PAGE_LABELS[nav_page]}!",
+                    "tool": "navigate_page", "args": {"page": nav_page}, "mode": "queue"}
+
+        # Weather (and similarly non-travel-booking questions) got misrouted to
+        # travel_search by the classifier just because a city was mentioned —
+        # e.g. "what's the weather in Chennai" produced a nonsensical
+        # Chennai-to-Chennai flight search. general_qa (with live web search
+        # grounding) is what can actually answer this; travel_search can't.
+        if re.search(r'\bweather\b', text.lower()):
+            return {"action": "delegate", "preamble": "Let me check that!",
+                    "tool": "general_qa", "args": {"query": text}, "mode": "queue"}
+
         # Fast path: slide number is deterministic — bypass Ollama to avoid 1-vs-0 index confusion.
-        # IMPORTANT: skip fast path if user said "delete/remove" — those must reach ppt_delete_slide.
+        # IMPORTANT: skip fast path if user gave a slide mutation command — those
+        # must reach ppt_edit_slide / ppt_generate_notes instead of becoming navigation.
         if usecase != "customercare":
             _tl = text.lower()
+            if usecase == "ppt" and _is_ppt_followup_question(text):
+                return {"action": "delegate", "preamble": None,
+                        "tool": "ppt_last_action", "args": {}, "mode": "queue"}
             _is_destructive = any(w in _tl for w in ("delete", "remove"))
-            if not _is_destructive:
-                _m = re.search(r'\bslide[s]?\s+(\d+)\b', _tl)
+            _is_slide_edit = (
+                any(w in _tl for w in ("edit", "change", "update", "rewrite", "reword", "shorten", "simplify", "format"))
+                or re.search(r'\bmake\s+slide[s]?\s*(?:number|no\.?|#)?\s*\d+\b', _tl) is not None
+            )
+            _is_notes_edit = "notes" in _tl and any(w in _tl for w in ("generate", "create", "write", "add"))
+            _is_add_slide = (
+                "notes" not in _tl
+                and re.search(r'\b(?:add|insert|create)\b', _tl) is not None
+                and "slide" in _tl
+            )
+            if usecase == "ppt" and _is_add_slide:
+                # Deterministic route — otherwise "add a slide after slide 3"
+                # falls straight into the generic slide-number fast path
+                # below (it contains a bare "slide 3") and gets misrouted to
+                # navigation instead of actually adding anything.
+                return {"action": "delegate", "preamble": "Adding a new slide!",
+                        "tool": "ppt_add_slide", "args": {"instruction": text}, "mode": "queue"}
+            if usecase == "ppt" and _is_notes_edit:
+                # Deterministic route — ppt_generate_notes is the only tool that can
+                # safely fulfill "generate/write/create notes"; leaving the choice
+                # between this and ppt_edit_slide to the classifier risks it picking
+                # the free-form editor, which has no notes-only mode and can
+                # hallucinate garbage into the title while leaving notes untouched.
+                notes_args: dict = {}
+                if re.search(r'\ball\s+slides?\b|\bevery\s+slide\b|\beach\s+slide\b', _tl):
+                    notes_args["all"] = True
+                else:
+                    slide_number = _extract_spoken_slide_number(text)
+                    if slide_number is not None:
+                        notes_args["slide_number"] = slide_number
+                preamble = "Generating speaker notes for every slide!" if notes_args.get("all") else "Generating speaker notes!"
+                return {"action": "delegate", "preamble": preamble,
+                        "tool": "ppt_generate_notes", "args": notes_args, "mode": "queue"}
+            if not _is_destructive and not _is_slide_edit and not _is_notes_edit and not _is_add_slide:
+                _m = re.search(r'\bslide[s]?\s*(?:number|no\.?|#)?\s*(\d+)\b', _tl)
                 if _m:
                     num = int(_m.group(1))
                     return {"action": "delegate", "preamble": f"Going to slide {num}!",
@@ -337,7 +476,30 @@ class FrontLLMProvider:
             args.setdefault("symptoms", "")
         if tool == "ppt_jump_to_title" and not args.get("query"):
             args["query"] = text
-        if tool == "flight_search":
+        if tool == "ppt_edit_slide":
+            # Voice edits need the full utterance, not a generic placeholder,
+            # so the presentation editor can preserve the user's exact intent.
+            args["instruction"] = text
+            slide_number = _extract_spoken_slide_number(text)
+            if slide_number is not None:
+                args["slide_number"] = slide_number
+        if tool == "ppt_add_slide" and not args.get("instruction"):
+            args["instruction"] = text
+        if tool == "ppt_generate_notes" and not args.get("all"):
+            if re.search(r'\ball\s+slides?\b|\bevery\s+slide\b|\beach\s+slide\b', text.lower()):
+                args["all"] = True
+            else:
+                slide_number = _extract_spoken_slide_number(text)
+                if slide_number is not None:
+                    args["slide_number"] = slide_number
+        if tool == "travel_search":
+            # The tool does its own service_type (flights/hotels/trains/cabs)
+            # detection by scanning the raw query text — always pass it
+            # through, not just when an origin/destination regex happens to
+            # match, or a query like "book a hotel in Mumbai" (no "from X to
+            # Y") would reach the tool with no way to tell it isn't a flight
+            # search.
+            args["query"] = text
             # Strip trailing punctuation so "from Chennai to Mumbai." works
             t = re.sub(r'[.,!?]+$', '', text.lower().strip())
             # Extract "from X to Y"
@@ -353,6 +515,12 @@ class FrontLLMProvider:
                 m2 = re.search(r'\bto\s+([a-zA-Z ]+?)(?:\s+on\b|\s+from\b|\s*$)', t)
                 if m2:
                     args.setdefault("destination", m2.group(1).strip())
+                else:
+                    # "hotel in Mumbai" / "hotels near Goa" — the natural phrasing
+                    # for a single-location search (no "from X to Y" for hotels).
+                    m3 = re.search(r'\b(?:in|near|at)\s+([a-zA-Z ]+?)(?:\s+on\b|\s+for\b|\s*$)', t)
+                    if m3:
+                        args.setdefault("destination", m3.group(1).strip())
             # Date extraction — explicit dates (ISO, "July 17", bare "10th") win
             # over vague tomorrow/today keywords. Otherwise a correction like
             # "not today, I want the 10th" would match "today" as a substring
@@ -384,8 +552,44 @@ class FrontLLMProvider:
         care_only = usecase == "customercare"
 
         if not care_only:
+            if ppt_only and _is_ppt_followup_question(text):
+                return {"action": "delegate", "preamble": None,
+                        "tool": "ppt_last_action", "args": {}, "mode": "queue"}
+            # Checked before the generic edit_m below — "add a slide about X"
+            # must never fall into ppt_edit_slide (which only mutates an
+            # EXISTING slide), and "notes" is excluded so "add notes to this
+            # slide" still reaches the notes-generation check further down.
+            if (re.search(r'\b(?:add|insert|create)\b', t) and re.search(r'\bslide\b', t)
+                    and not re.search(r'\bnotes?\b', t)):
+                return {"action": "delegate", "preamble": "Adding a new slide!",
+                        "tool": "ppt_add_slide",
+                        "args": {"instruction": text},
+                        "mode": "queue"}
+            edit_m = re.search(
+                r'\b(?:edit|change|update|rewrite|reword|shorten|simplify|format|make)\b.*\b(?:slide|flight)[s]?\s*(?:number|no\.?|#)?\s*(\d+)\b'
+                r'|\b(?:slide|flight)[s]?\s*(?:number|no\.?|#)?\s*(\d+)\b.*\b(?:more concise|shorter|clearer|simpler|better|professional)\b',
+                t,
+            )
+            if edit_m:
+                num = int(edit_m.group(1) or edit_m.group(2))
+                return {"action": "delegate", "preamble": "Editing the slide!",
+                        "tool": "ppt_edit_slide",
+                        "args": {"instruction": text, "slide_number": num - 1},
+                        "mode": "queue"}
+            if re.search(r'\b(?:edit|change|update|rewrite|reword|shorten|simplify|format|make)\b', t):
+                return {"action": "delegate", "preamble": "Editing the slide!",
+                        "tool": "ppt_edit_slide",
+                        "args": {"instruction": text},
+                        "mode": "queue"}
+            notes_m = re.search(r'\b(?:generate|create|write|add)\b.*\bnotes?\b.*\bslide[s]?\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
+            if notes_m:
+                num = int(notes_m.group(1))
+                return {"action": "delegate", "preamble": "Generating speaker notes!",
+                        "tool": "ppt_generate_notes",
+                        "args": {"slide_number": num - 1},
+                        "mode": "queue"}
             # "delete slide 10" / "remove slide 3" — must be checked BEFORE generic slide-N navigation
-            del_m = re.search(r'\b(?:delete|remove)\b.*?\bslide[s]?\s+(\d+)\b', t)
+            del_m = re.search(r'\b(?:delete|remove)\b.*?\bslide[s]?\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
             if del_m:
                 num = int(del_m.group(1))
                 return {"action": "delegate", "preamble": None,
@@ -393,7 +597,7 @@ class FrontLLMProvider:
                         "args": {"slide_number": num - 1},
                         "mode": "queue"}
             # Generic slide number → navigate
-            m = re.search(r'\bslide[s]?\s+(\d+)\b', t)
+            m = re.search(r'\bslide[s]?\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
             if m:
                 num = int(m.group(1))
                 return {"action": "delegate", "preamble": f"Going to slide {num}!",
@@ -401,7 +605,7 @@ class FrontLLMProvider:
                         "args": {"query": text, "slide_number": num - 1},
                         "mode": "queue"}
 
-        _CARE_TOOLS = {"ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","flight_search","flight_book"}
+        _CARE_TOOLS = {"ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","travel_search","flight_book"}
 
         for keywords, response in _KEYWORDS:
             tool = response.get("tool", "")
@@ -420,7 +624,7 @@ class FrontLLMProvider:
                     r["args"]["query"] = text
                 if r.get("tool") == "ticket_create":
                     r["args"] = {"category": "general", "synopsis": text, "symptoms": ""}
-                if r.get("tool") == "flight_search":
+                if r.get("tool") == "travel_search":
                     r = self._fill_args(r, text)
                 return r
 

@@ -167,7 +167,12 @@ _TOOL_DENIAL = {
 
 # ── Tool arg whitelist — type + max-length per field ─────────────────────────
 _ARG_SCHEMA: dict[str, dict[str, tuple]] = {
-    "flight_search":     {"origin": (str, 80), "destination": (str, 80), "date": (str, 10)},
+    # "query" carries the raw utterance through — travel_search does its own
+    # service_type detection (flights/hotels/trains/cabs) by scanning it for
+    # keywords, so without it every request silently defaults to "flights"
+    # regardless of what was actually asked (origin/destination alone don't
+    # say whether this is a flight, hotel, or train search).
+    "travel_search":     {"origin": (str, 80), "destination": (str, 80), "date": (str, 10), "query": (str, 300)},
     "flight_book":       {"flight_id": (str, 40)},
     "kb_search":         {"query": (str, 300)},
     "ticket_create":     {"synopsis": (str, 300), "category": (str, 50), "symptoms": (str, 500)},
@@ -179,9 +184,15 @@ _ARG_SCHEMA: dict[str, dict[str, tuple]] = {
     "ppt_jump_to_title": {"query": (str, 200), "slide_number": (int, None)},
     "ppt_summarize":     {},
     "ppt_delete_slide":  {"slide_number": (int, None)},
+    "ppt_edit_slide":    {"instruction": (str, 500), "slide_number": (int, None)},
+    "ppt_generate_notes": {"slide_number": (int, None), "all": (bool, None)},
+    "ppt_last_action":   {},
+    "ppt_add_slide":     {"instruction": (str, 300)},
+    "navigate_page":     {"page": (str, 20)},
 }
 
 _ALLOWED_DIRECTION = {"next", "prev", "first", "last"}
+_ALLOWED_PAGES = {"dashboard", "ppt", "care", "guidelines", "about", "profile", "settings"}
 
 def _sanitize_args(tool: str, args: dict) -> dict:
     """Validate and coerce LLM-generated tool args. Drops unknown keys, enforces types/lengths."""
@@ -198,6 +209,8 @@ def _sanitize_args(tool: str, args: dict) -> dict:
                 clean[field] = max(0, int(val))
             except (ValueError, TypeError):
                 pass
+        elif typ is bool:
+            clean[field] = bool(val)
         elif typ is str:
             val = str(val)[:maxlen] if maxlen else str(val)
             val = val.strip()
@@ -206,6 +219,8 @@ def _sanitize_args(tool: str, args: dict) -> dict:
             val = _re.sub(r'<[^>]+>', '', val)
             if field == "direction" and val not in _ALLOWED_DIRECTION:
                 val = "next"
+            if field == "page" and val.lower() not in _ALLOWED_PAGES:
+                continue
             if val:
                 clean[field] = val
     return clean

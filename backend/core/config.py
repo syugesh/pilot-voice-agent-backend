@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     WHISPER_MODEL: str = "distil-large-v3"
     OLLAMA_MODEL: str = "qwen3:8b"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
+    # Hard ceiling on a single classify() call to Ollama. Without this, a slow
+    # or memory-starved Ollama instance blocks the whole voice pipeline for as
+    # long as it takes (observed: 40s+ under system memory pressure) instead
+    # of degrading to the deterministic keyword fallback.
+    OLLAMA_TIMEOUT_S: float = 6.0
     GEMINI_API_KEY: Optional[str] = None
     GROQ_API_KEY: Optional[str] = None
     SERPAPI_KEY: Optional[str] = None
