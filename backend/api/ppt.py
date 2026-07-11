@@ -1,9 +1,10 @@
 """PPT API — navigate + file upload + AI generation with slide extraction."""
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import os, json, asyncio, subprocess, shutil, glob, logging, time, re, tempfile, json
+from io import BytesIO
 
 logger = logging.getLogger("pilot.ppt")
 
@@ -23,6 +24,7 @@ _ppt_titles:  dict[str, str]       = {}   # session_id → presentation title (f
 _latest_upload_sid: str = ""               # fallback key for voice-session lookups
 _current_slide: dict[str, int] = {}        # session_id → 0-indexed current slide
 _slide_version_store: dict[str, dict[int, list[dict]]] = {}  # session_id → slide_index → previous versions
+_ppt_render_locks: dict[str, asyncio.Lock] = {}
 
 _INDEX_PATH = "data/ppt/index.json"
 
@@ -55,6 +57,35 @@ def _save_kinds(session_id: str, kinds: list):
 def _load_kinds(session_id: str) -> list | None:
     try:
         path = _kinds_path(session_id)
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def _sources_path(session_id: str) -> str:
+    return f"data/ppt/{session_id}.sources.json"
+
+
+def _save_sources(session_id: str, sources: list):
+    """Persist which exact candidate slide (of possibly several for that
+    kind — see _KIND_SOURCES in ppt_template_builder.py) each slide was
+    cloned from, as "template_path::index" strings aligned 1:1 with the
+    kinds sidecar. Different candidates for the same kind don't share
+    shape_ids, so editing a slide later needs to know precisely which one
+    it came from to compute the matching slot map — just knowing the kind
+    isn't enough once a kind can be built from more than one template slide.
+    """
+    os.makedirs("data/ppt", exist_ok=True)
+    with open(_sources_path(session_id), "w") as f:
+        json.dump(sources, f)
+
+
+def _load_sources(session_id: str) -> list | None:
+    try:
+        path = _sources_path(session_id)
         if os.path.exists(path):
             with open(path) as f:
                 return json.load(f)
@@ -140,53 +171,74 @@ def _find_pdftoppm() -> str | None:
     return None
 
 
-def _convert_to_images_sync(pptx_path: str, out_dir: str) -> list[str]:
-    """Convert every slide to a PNG: PPTX → PDF (LibreOffice) → PNGs (pdftoppm)."""
+def _convert_to_images_sync(pptx_path: str, out_dir: str, keep_existing_on_failure: bool = True) -> list[str]:
+    """Convert every slide to PNGs without deleting the last good render first."""
     soffice = _find_soffice()
     if not soffice:
-        return []
+        existing = sorted(
+            glob.glob(os.path.join(out_dir, "slide-*.png")),
+            key=lambda p: int("".join(filter(str.isdigit, os.path.basename(p))) or "0"),
+        )
+        return existing if keep_existing_on_failure else []
     os.makedirs(out_dir, exist_ok=True)
 
-    # Clear stale output from a previous upload into this same slot — otherwise
-    # leftover slide-N.png from a bigger deck lingers on disk after a smaller
-    # deck is uploaded in its place.
-    for stale in glob.glob(os.path.join(out_dir, "slide-*.png")) + glob.glob(os.path.join(out_dir, "*.pdf")):
-        try:
-            os.remove(stale)
-        except OSError:
-            pass
-
-    # Step 1: PPTX → PDF — LibreOffice produces a faithful multi-page PDF
-    r = subprocess.run(
-        [soffice, "--headless", "--convert-to", "pdf", "--outdir", out_dir, pptx_path],
-        capture_output=True, text=True, timeout=120,
+    existing_images = sorted(
+        glob.glob(os.path.join(out_dir, "slide-*.png")),
+        key=lambda p: int("".join(filter(str.isdigit, os.path.basename(p))) or "0"),
     )
-    basename = os.path.splitext(os.path.basename(pptx_path))[0]
-    pdf_path = os.path.join(out_dir, f"{basename}.pdf")
-    if r.returncode != 0 or not os.path.exists(pdf_path):
-        logger.error(f"LibreOffice PDF conversion failed: {r.stderr[:300]}")
-        return []
+    work_dir = tempfile.mkdtemp(prefix="ppt-render-")
 
-    # Step 2: PDF pages → PNGs via pdftoppm (installed via: brew install poppler)
-    pdftoppm = _find_pdftoppm()
-    if not pdftoppm:
-        logger.warning("pdftoppm not found — install poppler: brew install poppler")
-        return []
+    try:
+        # Step 1: PPTX → PDF — LibreOffice produces a faithful multi-page PDF.
+        r = subprocess.run(
+            [soffice, "--headless", "--convert-to", "pdf", "--outdir", work_dir, pptx_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        basename = os.path.splitext(os.path.basename(pptx_path))[0]
+        pdf_path = os.path.join(work_dir, f"{basename}.pdf")
+        if r.returncode != 0 or not os.path.exists(pdf_path):
+            logger.error(f"LibreOffice PDF conversion failed: {r.stderr[:300]}")
+            return existing_images if keep_existing_on_failure else []
 
-    prefix = os.path.join(out_dir, "slide")
-    r2 = subprocess.run(
-        [pdftoppm, "-png", "-r", "150", pdf_path, prefix],
-        capture_output=True, text=True, timeout=120,
-    )
-    if r2.returncode != 0:
-        logger.error(f"pdftoppm failed: {r2.stderr[:300]}")
-        return []
+        # Step 2: PDF pages → PNGs via pdftoppm (installed via: brew install poppler).
+        pdftoppm = _find_pdftoppm()
+        if not pdftoppm:
+            logger.warning("pdftoppm not found — install poppler: brew install poppler")
+            return existing_images if keep_existing_on_failure else []
 
-    # pdftoppm outputs: slide-1.png, slide-2.png … (or slide-01.png with zero-padding)
-    images = sorted(glob.glob(os.path.join(out_dir, "slide-*.png")),
-                    key=lambda p: int("".join(filter(str.isdigit, os.path.basename(p))) or "0"))
-    logger.info(f"Converted {len(images)} slides to PNG")
-    return images
+        prefix = os.path.join(work_dir, "slide")
+        r2 = subprocess.run(
+            [pdftoppm, "-png", "-r", "150", pdf_path, prefix],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r2.returncode != 0:
+            logger.error(f"pdftoppm failed: {r2.stderr[:300]}")
+            return existing_images if keep_existing_on_failure else []
+
+        rendered = sorted(
+            glob.glob(os.path.join(work_dir, "slide-*.png")),
+            key=lambda p: int("".join(filter(str.isdigit, os.path.basename(p))) or "0"),
+        )
+        if not rendered:
+            logger.error("PDF conversion produced no slide images")
+            return existing_images if keep_existing_on_failure else []
+
+        for stale in glob.glob(os.path.join(out_dir, "slide-*.png")) + glob.glob(os.path.join(out_dir, "*.pdf")):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+
+        final_images: list[str] = []
+        for i, src in enumerate(rendered, start=1):
+            dst = os.path.join(out_dir, f"slide-{i}.png")
+            shutil.move(src, dst)
+            final_images.append(dst)
+
+        logger.info(f"Converted {len(final_images)} slides to PNG")
+        return final_images
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @router.post("/upload")
@@ -202,7 +254,7 @@ async def upload_ppt(session_id: str, file: UploadFile = File(...)):
 
     # Convert to slide images (faithful visual) — run in thread (blocking)
     img_dir   = f"data/ppt/slides/{session_id}"
-    img_paths = await asyncio.to_thread(_convert_to_images_sync, path, img_dir)
+    img_paths = await asyncio.to_thread(_convert_to_images_sync, path, img_dir, False)
 
     # Extract text metadata for voice navigation + summarise
     slides = await _extract_slides(path)
@@ -271,12 +323,13 @@ async def generate_ppt(req: GenerateRequest):
     # Step 2 — clone the matching GD template slides and populate them
     os.makedirs("data/ppt", exist_ok=True)
     pptx_path = f"data/ppt/{req.session_id}.pptx"
-    await asyncio.to_thread(build_deck_from_template, content, pptx_path)
+    sources = await asyncio.to_thread(build_deck_from_template, content, pptx_path)
     _save_kinds(req.session_id, [s.get("kind") for s in content["slides"]])
+    _save_sources(req.session_id, sources)
 
     # Step 3 — convert to slide images if LibreOffice is available (same as upload)
     img_dir   = f"data/ppt/slides/{req.session_id}"
-    img_paths = await asyncio.to_thread(_convert_to_images_sync, pptx_path, img_dir)
+    img_paths = await asyncio.to_thread(_convert_to_images_sync, pptx_path, img_dir, False)
 
     # Step 4 — extract metadata into the same format the viewer expects
     slides = await _extract_slides(pptx_path)
@@ -454,14 +507,17 @@ async def get_slide_schema(session_id: str, slide_index: int):
     if not kind:
         return {"kind": None}
 
-    from services.ppt_template_builder import extract_slide_data, KIND_FIELD_SCHEMA
+    sources = _load_sources(session_id)
+    source = sources[slide_index] if sources and 0 <= slide_index < len(sources) else None
+
+    from services.ppt_template_builder import extract_slide_data, KIND_FIELD_SCHEMA, _parse_source
 
     def _read():
         from pptx import Presentation
         prs = Presentation(pptx_path)
         if slide_index >= len(prs.slides):
             return None
-        return extract_slide_data(prs.slides[slide_index], kind)
+        return extract_slide_data(prs.slides[slide_index], kind, _parse_source(source))
 
     data = await asyncio.to_thread(_read)
     if data is None:
@@ -494,10 +550,13 @@ async def edit_slide_kind(req: EditSlideKindReq):
     if not os.path.exists(pptx_path):
         raise HTTPException(404, "No presentation found for this session")
 
-    from services.ppt_template_builder import populate_slide_data
+    from services.ppt_template_builder import populate_slide_data, _parse_source
+
+    sources = _load_sources(req.session_id)
+    source = sources[req.slide_index] if sources and 0 <= req.slide_index < len(sources) else None
 
     def _writer(slide):
-        populate_slide_data(slide, req.kind, req.data)
+        populate_slide_data(slide, req.kind, req.data, _parse_source(source))
         if req.notes is not None:
             try:
                 notes_tf = slide.notes_slide.notes_text_frame
@@ -586,18 +645,20 @@ async def refresh_slide_thumbnails_async(session_id: str) -> Optional[List[dict]
     if not os.path.exists(pptx_path):
         return None
 
-    img_dir   = f"data/ppt/slides/{session_id}"
-    img_paths = await asyncio.to_thread(_convert_to_images_sync, pptx_path, img_dir)
+    lock = _ppt_render_locks.setdefault(session_id, asyncio.Lock())
+    async with lock:
+        img_dir   = f"data/ppt/slides/{session_id}"
+        img_paths = await asyncio.to_thread(_convert_to_images_sync, pptx_path, img_dir)
 
-    slides = await _extract_slides(pptx_path)
-    version = int(time.time() * 1000)
-    for i, slide in enumerate(slides):
-        if i < len(img_paths):
-            fname = os.path.basename(img_paths[i])
-            slide["image_url"] = f"/api/v1/ppt/image/{session_id}/{fname}?v={version}"
+        slides = await _extract_slides(pptx_path)
+        version = int(time.time() * 1000)
+        for i, slide in enumerate(slides):
+            if i < len(img_paths):
+                fname = os.path.basename(img_paths[i])
+                slide["image_url"] = f"/api/v1/ppt/image/{session_id}/{fname}?v={version}"
 
-    _slide_store[session_id] = slides
-    return slides
+        _slide_store[session_id] = slides
+        return slides
 
 
 async def apply_slide_edit_async(
@@ -619,6 +680,414 @@ async def apply_slide_edit_async(
     if not ok:
         return None
     return await refresh_slide_thumbnails_async(session_id)
+
+
+# ── WYSIWYG canvas geometry write ────────────────────────────────────────────
+
+class ShapeGeometry(BaseModel):
+    shape_id: int
+    # All percentages of the slide (0–100), matching what _extract_sync emits.
+    # Any field omitted (None) is left unchanged on that shape.
+    left:   Optional[float] = None
+    top:    Optional[float] = None
+    width:  Optional[float] = None
+    height: Optional[float] = None
+    rotation: Optional[float] = None
+
+
+class SlideGeometryReq(BaseModel):
+    session_id:  str
+    slide_index: int
+    shapes:      List[ShapeGeometry]   # batch: a drag+resize can move several at once
+
+
+def _write_geometry_sync(pptx_path: str, slide_index: int, shapes: List[ShapeGeometry]):
+    """Write shape position/size/rotation to the .pptx. Percent → EMU using the
+    real slide dimensions, keyed by the stable shape_id (never array index, so
+    a canvas edit can't hit the wrong shape). Unknown shape_ids are skipped."""
+    from pptx import Presentation
+    from pptx.util import Emu
+    from services.ppt_template_builder import _shape_by_id
+
+    prs = Presentation(pptx_path)
+    if slide_index >= len(prs.slides):
+        raise ValueError(f"Slide {slide_index} does not exist in the file")
+    slide = prs.slides[slide_index]
+    sw, sh = int(prs.slide_width), int(prs.slide_height)
+
+    for g in shapes:
+        shape = _shape_by_id(slide, g.shape_id)
+        if shape is None:
+            logger.warning(f"geometry: shape_id {g.shape_id} not found on slide {slide_index}")
+            continue
+        if g.left   is not None: shape.left   = Emu(int(sw * g.left   / 100))
+        if g.top    is not None: shape.top    = Emu(int(sh * g.top    / 100))
+        if g.width  is not None: shape.width  = Emu(int(sw * g.width  / 100))
+        if g.height is not None: shape.height = Emu(int(sh * g.height / 100))
+        if g.rotation is not None:
+            try:
+                shape.rotation = float(g.rotation)
+            except Exception:
+                pass  # not all shape types support rotation
+    prs.save(pptx_path)
+
+
+async def apply_shape_geometry_async(session_id: str, slide_index: int,
+                                      shapes: List[ShapeGeometry]) -> Optional[List[dict]]:
+    """Fast geometry write + thumbnail refresh, mirroring apply_slide_edit_async."""
+    pptx_path = f"data/ppt/{session_id}.pptx"
+    if not os.path.exists(pptx_path):
+        return None
+    slides_mem = _slide_store.get(session_id, [])
+    if slide_index < 0 or slide_index >= len(slides_mem):
+        return None
+    await asyncio.to_thread(_write_geometry_sync, pptx_path, slide_index, shapes)
+    return await refresh_slide_thumbnails_async(session_id)
+
+
+class ShapeTextReq(BaseModel):
+    session_id:  str
+    slide_index: int
+    shape_id:    int
+    text:        str
+
+
+@router.patch("/slide/shape-text")
+async def edit_shape_text(req: ShapeTextReq):
+    """Set one shape's text by shape_id — the inline-text-edit path behind the
+    WYSIWYG canvas. Reuses _set_shape_text (preserves the shape's existing
+    font styling) rather than the title/bullets-shaped PATCH /slide."""
+    if re.search(r'[/\\.]\.', req.session_id):
+        raise HTTPException(400, "Invalid session id")
+    pptx_path = f"data/ppt/{req.session_id}.pptx"
+    if not os.path.exists(pptx_path):
+        raise HTTPException(404, "No presentation found for this session")
+
+    from services.ppt_template_builder import _shape_by_id
+
+    def _writer(slide):
+        shape = _shape_by_id(slide, req.shape_id)
+        if shape is not None and shape.has_text_frame:
+            _set_shape_text(shape, req.text)
+
+    slides = await apply_slide_edit_async(req.session_id, req.slide_index, _writer)
+    if slides is None:
+        raise HTTPException(400, f"Slide index {req.slide_index} out of range")
+    return {"status": "ok", "slides": slides}
+
+
+def _replace_picture_sync(pptx_path: str, slide_index: int, shape_id: int, image_bytes: bytes):
+    from pptx import Presentation
+    from services.ppt_template_builder import _shape_by_id
+
+    prs = Presentation(pptx_path)
+    if slide_index >= len(prs.slides):
+        raise ValueError(f"Slide {slide_index} does not exist in the file")
+
+    slide = prs.slides[slide_index]
+    shape = _shape_by_id(slide, shape_id)
+    if shape is None:
+        raise ValueError(f"Shape {shape_id} does not exist on slide {slide_index}")
+
+    left, top, width, height = shape.left, shape.top, shape.width, shape.height
+    try:
+        rotation = float(shape.rotation or 0)
+    except Exception:
+        rotation = 0
+
+    # python-pptx has no public "replace image" API. Remove the selected
+    # picture-like shape and insert the uploaded bitmap at the same geometry.
+    shape._element.getparent().remove(shape._element)
+    new_shape = slide.shapes.add_picture(BytesIO(image_bytes), left, top, width=width, height=height)
+    try:
+        new_shape.rotation = rotation
+    except Exception:
+        pass
+    prs.save(pptx_path)
+
+
+@router.patch("/slide/shape-image")
+async def edit_shape_image(
+    session_id: str = Form(...),
+    slide_index: int = Form(...),
+    shape_id: int = Form(...),
+    file: UploadFile = File(...),
+):
+    """Replace a picture shape from the WYSIWYG canvas, then re-render the
+    LibreOffice preview so the user sees the actual deck output."""
+    if re.search(r'[/\\.]\.', session_id):
+        raise HTTPException(400, "Invalid session id")
+    pptx_path = f"data/ppt/{session_id}.pptx"
+    if not os.path.exists(pptx_path):
+        raise HTTPException(404, "No presentation found for this session")
+
+    content_type = (file.content_type or "").lower()
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(400, "Only image uploads are supported")
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(400, "Uploaded image is empty")
+
+    try:
+        await asyncio.to_thread(_replace_picture_sync, pptx_path, slide_index, shape_id, image_bytes)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    slides = await refresh_slide_thumbnails_async(session_id)
+    if slides is None:
+        raise HTTPException(400, f"Slide index {slide_index} out of range")
+    return {"status": "ok", "slides": slides}
+
+
+class ShapeStyleReq(BaseModel):
+    session_id:  str
+    slide_index: int
+    shape_id:    int
+    # All optional — only fields present are changed, matching ShapeGeometry's
+    # partial-update convention so the toolbar can send just what the user toggled.
+    bold:      Optional[bool]  = None
+    italic:    Optional[bool]  = None
+    underline: Optional[bool]  = None
+    font:      Optional[str]   = None
+    size:      Optional[float] = None
+    color:     Optional[str]   = None   # "#RRGGBB"
+    align:     Optional[str]   = None   # left | center | right | justify
+
+
+def _apply_run_style(run, req: "ShapeStyleReq"):
+    from pptx.util import Pt
+    from pptx.dml.color import RGBColor
+    if req.bold is not None:
+        run.font.bold = req.bold
+    if req.italic is not None:
+        run.font.italic = req.italic
+    if req.underline is not None:
+        run.font.underline = req.underline
+    if req.font is not None:
+        run.font.name = req.font
+    if req.size is not None:
+        run.font.size = Pt(req.size)
+    if req.color is not None:
+        hexcolor = req.color.lstrip("#")
+        if len(hexcolor) == 6:
+            run.font.color.rgb = RGBColor.from_string(hexcolor.upper())
+
+
+def _write_shape_style_sync(pptx_path: str, slide_index: int, req: "ShapeStyleReq"):
+    from pptx import Presentation
+    from pptx.enum.text import PP_ALIGN
+    from services.ppt_template_builder import _shape_by_id
+
+    prs = Presentation(pptx_path)
+    if slide_index >= len(prs.slides):
+        raise ValueError(f"Slide {slide_index} does not exist in the file")
+    slide = prs.slides[slide_index]
+    shape = _shape_by_id(slide, req.shape_id)
+    if shape is None or not shape.has_text_frame:
+        raise ValueError(f"Shape {req.shape_id} does not exist or has no text on slide {slide_index}")
+
+    align_map = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER,
+                 "right": PP_ALIGN.RIGHT, "justify": PP_ALIGN.DISTRIBUTE}
+
+    for para in shape.text_frame.paragraphs:
+        if req.align is not None and req.align in align_map:
+            para.alignment = align_map[req.align]
+        for run in para.runs:
+            _apply_run_style(run, req)
+    prs.save(pptx_path)
+
+
+@router.patch("/slide/shape-style")
+async def edit_shape_style(req: ShapeStyleReq):
+    """Apply text formatting (bold/italic/underline/font/size/color/align) to
+    every run in a shape — the write path behind the canvas toolbar."""
+    if re.search(r'[/\\.]\.', req.session_id):
+        raise HTTPException(400, "Invalid session id")
+    pptx_path = f"data/ppt/{req.session_id}.pptx"
+    if not os.path.exists(pptx_path):
+        raise HTTPException(404, "No presentation found for this session")
+
+    try:
+        await asyncio.to_thread(_write_shape_style_sync, pptx_path, req.slide_index, req)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    slides = await refresh_slide_thumbnails_async(req.session_id)
+    if slides is None:
+        raise HTTPException(400, f"Slide index {req.slide_index} out of range")
+    return {"status": "ok", "slides": slides}
+
+
+class AddTextBoxReq(BaseModel):
+    session_id:  str
+    slide_index: int
+    text:        str = "New text"
+    left:   float = 35.0
+    top:    float = 40.0
+    width:  float = 30.0
+    height: float = 12.0
+
+
+def _add_textbox_sync(pptx_path: str, req: "AddTextBoxReq") -> int:
+    from pptx import Presentation
+    from pptx.util import Emu, Pt
+
+    prs = Presentation(pptx_path)
+    if req.slide_index >= len(prs.slides):
+        raise ValueError(f"Slide {req.slide_index} does not exist in the file")
+    slide = prs.slides[req.slide_index]
+    sw, sh = int(prs.slide_width), int(prs.slide_height)
+
+    box = slide.shapes.add_textbox(
+        Emu(int(sw * req.left / 100)), Emu(int(sh * req.top / 100)),
+        Emu(int(sw * req.width / 100)), Emu(int(sh * req.height / 100)),
+    )
+    tf = box.text_frame
+    tf.word_wrap = True
+    tf.paragraphs[0].text = req.text
+    run = tf.paragraphs[0].runs[0]
+    run.font.size = Pt(24)
+    prs.save(pptx_path)
+    return box.shape_id
+
+
+@router.post("/slide/shape-add-text")
+async def add_text_box(req: AddTextBoxReq):
+    """Insert a new text box onto the slide at the given percent geometry —
+    the write path behind the canvas toolbar's "Add text box" button."""
+    if re.search(r'[/\\.]\.', req.session_id):
+        raise HTTPException(400, "Invalid session id")
+    pptx_path = f"data/ppt/{req.session_id}.pptx"
+    if not os.path.exists(pptx_path):
+        raise HTTPException(404, "No presentation found for this session")
+
+    try:
+        new_shape_id = await asyncio.to_thread(_add_textbox_sync, pptx_path, req)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    slides = await refresh_slide_thumbnails_async(req.session_id)
+    if slides is None:
+        raise HTTPException(400, f"Slide index {req.slide_index} out of range")
+    return {"status": "ok", "shape_id": new_shape_id, "slides": slides}
+
+
+class ShapeDeleteReq(BaseModel):
+    session_id:  str
+    slide_index: int
+    shape_id:    int
+
+
+def _delete_shape_sync(pptx_path: str, req: "ShapeDeleteReq"):
+    from pptx import Presentation
+    from services.ppt_template_builder import _shape_by_id
+
+    prs = Presentation(pptx_path)
+    if req.slide_index >= len(prs.slides):
+        raise ValueError(f"Slide {req.slide_index} does not exist in the file")
+    slide = prs.slides[req.slide_index]
+    shape = _shape_by_id(slide, req.shape_id)
+    if shape is None:
+        raise ValueError(f"Shape {req.shape_id} does not exist on slide {req.slide_index}")
+    shape._element.getparent().remove(shape._element)
+    prs.save(pptx_path)
+
+
+@router.delete("/slide/shape")
+async def delete_shape(req: ShapeDeleteReq):
+    """Remove a shape from a slide entirely — the write path behind the
+    canvas toolbar's "Delete" button."""
+    if re.search(r'[/\\.]\.', req.session_id):
+        raise HTTPException(400, "Invalid session id")
+    pptx_path = f"data/ppt/{req.session_id}.pptx"
+    if not os.path.exists(pptx_path):
+        raise HTTPException(404, "No presentation found for this session")
+
+    try:
+        await asyncio.to_thread(_delete_shape_sync, pptx_path, req)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    slides = await refresh_slide_thumbnails_async(req.session_id)
+    if slides is None:
+        raise HTTPException(400, f"Slide index {req.slide_index} out of range")
+    return {"status": "ok", "slides": slides}
+
+
+class ShapeZOrderReq(BaseModel):
+    session_id:  str
+    slide_index: int
+    shape_id:    int
+    direction:   str   # "front" | "back"
+
+
+def _reorder_shape_sync(pptx_path: str, req: "ShapeZOrderReq"):
+    from pptx import Presentation
+    from services.ppt_template_builder import _shape_by_id
+
+    prs = Presentation(pptx_path)
+    if req.slide_index >= len(prs.slides):
+        raise ValueError(f"Slide {req.slide_index} does not exist in the file")
+    slide = prs.slides[req.slide_index]
+    shape = _shape_by_id(slide, req.shape_id)
+    if shape is None:
+        raise ValueError(f"Shape {req.shape_id} does not exist on slide {req.slide_index}")
+    spTree = shape._element.getparent()
+    el = shape._element
+    spTree.remove(el)
+    if req.direction == "front":
+        spTree.append(el)
+    else:
+        # Insert after the last non-shape (grpSpPr/nvGrpSpPr) element so it
+        # lands at the very back of the drawable shapes, not before them.
+        idx = 0
+        for i, child in enumerate(spTree):
+            if child.tag.endswith("}nvGrpSpPr") or child.tag.endswith("}grpSpPr"):
+                idx = i + 1
+        spTree.insert(idx, el)
+    prs.save(pptx_path)
+
+
+@router.patch("/slide/shape-zorder")
+async def reorder_shape(req: ShapeZOrderReq):
+    """Bring a shape to front or send it to back — the write path behind the
+    canvas toolbar's layering buttons."""
+    if re.search(r'[/\\.]\.', req.session_id):
+        raise HTTPException(400, "Invalid session id")
+    if req.direction not in ("front", "back"):
+        raise HTTPException(400, "direction must be 'front' or 'back'")
+    pptx_path = f"data/ppt/{req.session_id}.pptx"
+    if not os.path.exists(pptx_path):
+        raise HTTPException(404, "No presentation found for this session")
+
+    try:
+        await asyncio.to_thread(_reorder_shape_sync, pptx_path, req)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    slides = await refresh_slide_thumbnails_async(req.session_id)
+    if slides is None:
+        raise HTTPException(400, f"Slide index {req.slide_index} out of range")
+    return {"status": "ok", "slides": slides}
+
+
+@router.patch("/slide/geometry")
+async def edit_slide_geometry(req: SlideGeometryReq):
+    """Move/resize/rotate shapes on a slide — the write path behind the WYSIWYG
+    canvas. Accepts a batch of shape geometry deltas (percent), keyed by the
+    stable shape_id, so a single drag-and-resize is one round-trip."""
+    if re.search(r'[/\\.]\.', req.session_id):
+        raise HTTPException(400, "Invalid session id")
+    pptx_path = f"data/ppt/{req.session_id}.pptx"
+    if not os.path.exists(pptx_path):
+        raise HTTPException(404, "No presentation found for this session")
+    if not req.shapes:
+        raise HTTPException(400, "No shapes provided")
+
+    slides = await apply_shape_geometry_async(req.session_id, req.slide_index, req.shapes)
+    if slides is None:
+        raise HTTPException(400, f"Slide index {req.slide_index} out of range")
+    return {"status": "ok", "slides": slides}
 
 
 async def add_slide_fast_async(session_id: str, kind: str, data: dict,
@@ -646,18 +1115,26 @@ async def add_slide_fast_async(session_id: str, kind: str, data: dict,
     kinds = _load_kinds(session_id) or []
     if len(kinds) != count:
         kinds = kinds[:count] + [None] * max(0, count - len(kinds))
+    sources = _load_sources(session_id) or []
+    if len(sources) != count:
+        sources = sources[:count] + [None] * max(0, count - len(sources))
 
     # Clone an existing same-kind slide already in THIS deck when there is
     # one — avoids the cross-package image copy entirely for the common
-    # case. Falls back to pulling the kind fresh from the GD template.
+    # case, and inherits that slide's exact source so the slot map still
+    # matches. Otherwise a random candidate is pulled from the template
+    # pool (see _KIND_SOURCES) — different each time, on purpose.
     source_index_in_deck = next((i for i, k in enumerate(kinds) if k == kind), None)
+    existing_source = sources[source_index_in_deck] if source_index_in_deck is not None else None
 
-    new_index = await asyncio.to_thread(
-        add_slide_to_deck, pptx_path, kind, data, source_index_in_deck, insert_after
+    new_index, new_source = await asyncio.to_thread(
+        add_slide_to_deck, pptx_path, kind, data, source_index_in_deck, existing_source, insert_after
     )
 
     kinds.insert(new_index, kind)
+    sources.insert(new_index, new_source)
     _save_kinds(session_id, kinds)
+    _save_sources(session_id, sources)
     return new_index
 
 
@@ -1109,9 +1586,11 @@ def _extract_sync(path: str) -> list[dict]:
 
     session_id = os.path.splitext(os.path.basename(path))[0]
     kinds = _load_kinds(session_id)
+    sources = _load_sources(session_id)
 
     for i, slide in enumerate(prs.slides):
         kind = kinds[i] if kinds and i < len(kinds) else None
+        source = sources[i] if sources and i < len(sources) else None
 
         # --- Background color ---
         bg_color = "#111111"
@@ -1126,22 +1605,70 @@ def _extract_sync(path: str) -> list[dict]:
         except Exception:
             pass
 
-        # --- Shapes: text + styling + position ---
+        # --- Shapes: text/images + styling + position ---
         title = ""
         body  = ""
         shapes_data: list[dict] = []
         title_candidates: list[tuple[float, str]] = []
 
         for shape in slide.shapes:
+            try:
+                s_left  = round((shape.left  or 0) / SLIDE_W * 100, 2)
+                s_top   = round((shape.top   or 0) / SLIDE_H * 100, 2)
+                s_width = round((shape.width or SLIDE_W) / SLIDE_W * 100, 2)
+                s_height = round((shape.height or SLIDE_H) / SLIDE_H * 100, 2)
+            except Exception:
+                s_left, s_top, s_width, s_height = 0.0, 0.0, 90.0, 10.0
+            try:
+                s_rotation = float(shape.rotation or 0)
+            except Exception:
+                s_rotation = 0.0
+            try:
+                s_shape_id = shape.shape_id
+            except Exception:
+                s_shape_id = None
+
+            is_picture = False
+            try:
+                from pptx.enum.shapes import MSO_SHAPE_TYPE
+                is_picture = shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+            except Exception:
+                is_picture = "picture" in str(getattr(shape, "shape_type", "")).lower()
+
+            if is_picture:
+                shapes_data.append({
+                    "text":     "",
+                    "color":    "#000000",
+                    "size":     0,
+                    "bold":     False,
+                    "left":     s_left,
+                    "top":      s_top,
+                    "width":    s_width,
+                    "height":   s_height,
+                    "rotation": s_rotation,
+                    "align":    "left",
+                    "shape_id": s_shape_id,
+                    "type":     "image",
+                })
+                continue
+
             if not shape.has_text_frame:
                 continue
             text = shape.text_frame.text.strip()
             if not text:
                 continue
 
-            text_color = "#FFFFFF"
+            # None until a run reports an explicit RGB override — many shapes
+            # inherit their color from the theme/layout, which python-pptx
+            # cannot resolve to a concrete RGB, so we must not silently guess
+            # one (previously defaulted to white, which lied to the toolbar's
+            # color swatch on light-background decks).
+            text_color: Optional[str] = None
             font_size  = 24.0
             is_bold    = False
+            is_italic  = False
+            is_underline = False
+            font_name  = None
             s_align    = "left"
 
             try:
@@ -1174,44 +1701,42 @@ def _extract_sync(path: str) -> list[dict]:
                                 is_bold = run.font.bold
                         except Exception:
                             pass
+                        try:
+                            if run.font.italic is not None:
+                                is_italic = run.font.italic
+                        except Exception:
+                            pass
+                        try:
+                            if run.font.underline is not None:
+                                is_underline = bool(run.font.underline)
+                        except Exception:
+                            pass
+                        try:
+                            if run.font.name is not None:
+                                font_name = run.font.name
+                        except Exception:
+                            pass
                         break
                     break
             except Exception:
                 pass
-
-            # Position as percentage of slide dimensions
-            try:
-                s_left  = round((shape.left  or 0) / SLIDE_W * 100, 2)
-                s_top   = round((shape.top   or 0) / SLIDE_H * 100, 2)
-                s_width = round((shape.width or SLIDE_W) / SLIDE_W * 100, 2)
-                s_height = round((shape.height or SLIDE_H) / SLIDE_H * 100, 2)
-            except Exception:
-                s_left, s_top, s_width, s_height = 0.0, 0.0, 90.0, 10.0
-            try:
-                s_rotation = float(shape.rotation or 0)
-            except Exception:
-                s_rotation = 0.0
-
-            # shape_id is a stable python-pptx identifier for this exact shape —
-            # capturing it lets edit operations target one specific shape by id
-            # instead of guessing "the first non-title shape", which is what
-            # previously caused unrelated text boxes to get wiped out during a
-            # title-only or bullet-only edit (see _patch_slide_sync below).
-            try:
-                s_shape_id = shape.shape_id
-            except Exception:
-                s_shape_id = None
 
             shapes_data.append({
                 "text":     text,
                 "color":    text_color,
                 "size":     min(float(font_size), 80.0),
                 "bold":     is_bold,
+                "italic":   is_italic,
+                "underline": is_underline,
+                "font":     font_name,
                 "left":     s_left,
                 "top":      s_top,
                 "width":    s_width,
+                "height":   s_height,      # emitted for the WYSIWYG canvas (was computed, never sent)
+                "rotation": s_rotation,
                 "align":    s_align,
                 "shape_id": s_shape_id,
+                "type":     "text",
             })
 
             # Title extraction is heuristic because uploaded decks often contain
@@ -1285,8 +1810,8 @@ def _extract_sync(path: str) -> list[dict]:
         # every kind-aware code path is skipped entirely for them.
         if kind:
             try:
-                from services.ppt_template_builder import extract_slide_data
-                kind_title = extract_slide_data(slide, kind).get("title")
+                from services.ppt_template_builder import extract_slide_data, _parse_source
+                kind_title = extract_slide_data(slide, kind, _parse_source(source)).get("title")
                 if kind_title:
                     title = kind_title
             except Exception as e:
@@ -1297,8 +1822,16 @@ def _extract_sync(path: str) -> list[dict]:
             "title":    title,
             "notes":    speaker_notes,
             "bg_color": bg_color,
-            "shapes":   shapes_data[:15],
+            # Raised from 15 → 60 so the WYSIWYG canvas gets every editable
+            # shape (a busy slide can exceed 15); the title heuristic above
+            # already filters decoratively so extra shapes don't affect it.
+            "shapes":   shapes_data[:60],
             "kind":     kind,
+            "source":   source,
+            # EMU slide dimensions so the frontend can build an aspect-correct
+            # canvas and convert between its pixels and the shape percentages.
+            "slide_width":  SLIDE_W,
+            "slide_height": SLIDE_H,
         })
 
     return slides

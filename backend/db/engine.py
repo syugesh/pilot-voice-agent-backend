@@ -48,6 +48,9 @@ async def migrate_db():
     new_cols = [
         "ALTER TABLE users ADD COLUMN oauth_provider TEXT",
         "ALTER TABLE users ADD COLUMN oauth_id TEXT",
+        "ALTER TABLE tickets ADD COLUMN priority TEXT DEFAULT 'normal'",
+        "ALTER TABLE tickets ADD COLUMN escalated BOOLEAN DEFAULT 0",
+        "ALTER TABLE tickets ADD COLUMN escalation_target TEXT",
     ]
     async with engine.begin() as conn:
         for stmt in new_cols:

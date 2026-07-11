@@ -27,6 +27,24 @@ class SessionPipelineState:
     last_ppt_action: Optional[dict] = None
     active_tts_task: Optional[Any] = field(default=None, repr=False)
     tts_start_time: float = 0.0
+    # Set by ppt_add_slide when the user's instruction had no real topic
+    # ("add a slide" with nothing else) — the tool asks what it should be
+    # about instead of inventing content, and the NEXT utterance is routed
+    # straight back to ppt_add_slide as the answer rather than being
+    # independently (mis)classified. {"insert_after": int|None}. Not
+    # persisted to the DB snapshot — a same-session clarification shouldn't
+    # survive a reconnect and silently fire on an unrelated later utterance.
+    pending_add_slide: Optional[dict] = None
+    # Rolling per-turn customer sentiment for the CSR resolution dashboard —
+    # the resolution engine reads this to detect *sustained* high frustration
+    # (a single spike isn't an escalation signal; a trend is). Capped small;
+    # not persisted to the DB snapshot (live-call state, not history).
+    sentiment_history: list = field(default_factory=list)
+
+    def add_sentiment(self, entry: dict):
+        self.sentiment_history.append(entry)
+        if len(self.sentiment_history) > 20:
+            self.sentiment_history = self.sentiment_history[-20:]
 
     def add_span(self, span: dict):
         self.ring_buffer.append(span)

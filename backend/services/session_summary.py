@@ -49,6 +49,35 @@ def _fallback_summary(transcripts: list[dict], actions: list[dict]) -> str:
     )
 
 
+ISSUE_SUMMARY_PROMPT = """You are a customer-support assistant writing a concise
+issue synopsis for a service rep who is watching a live call. In 1-2 sentences,
+state the customer's core problem, how long it has been happening, and what they
+have already tried. Plain prose, no preamble, no markdown. Only use facts present
+in the transcript — do not invent details."""
+
+
+async def run_llm_chain(system_prompt: str, content: str, max_tokens: int = 300) -> str | None:
+    """Shared Ollama → Gemini → Groq reasoning chain used by session summary,
+    issue summary, and the resolution engine — one place to keep the fallback
+    order and provider config consistent. Returns None if all providers fail
+    (callers supply their own deterministic fallback)."""
+    return (
+        await _try_ollama(content, system_prompt, max_tokens)
+        or await _try_gemini(content, system_prompt)
+        or await _try_groq(content, system_prompt, max_tokens)
+    )
+
+
+async def summarize_issue(transcripts: list[dict]) -> str:
+    """CSR-facing 'Customer reports X for Y; tried Z' synopsis for the live
+    dashboard — reuses the shared LLM chain with an issue-focused prompt."""
+    if not transcripts:
+        return "No conversation yet."
+    content = f"Transcript:\n{_format_transcript(transcripts)}\n\nWrite the issue synopsis."
+    result = await run_llm_chain(ISSUE_SUMMARY_PROMPT, content, max_tokens=160)
+    return result or "Live issue summary is unavailable right now."
+
+
 async def summarize_session(transcripts: list[dict], actions: list[dict], usecase: str) -> str:
     if not transcripts:
         return "No conversation was recorded in this session."
@@ -68,7 +97,7 @@ async def summarize_session(transcripts: list[dict], actions: list[dict], usecas
     )
 
 
-async def _try_ollama(content: str) -> str | None:
+async def _try_ollama(content: str, system_prompt: str = SUMMARY_PROMPT, max_tokens: int = 300) -> str | None:
     try:
         import ollama
 
@@ -76,11 +105,11 @@ async def _try_ollama(content: str) -> str | None:
             response = ollama.chat(
                 model=settings.OLLAMA_MODEL,
                 messages=[
-                    {"role": "system", "content": SUMMARY_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user",   "content": content},
                 ],
                 think=False,
-                options={"num_predict": 300},
+                options={"num_predict": max_tokens},
                 stream=False,
             )
             if isinstance(response, dict):
@@ -93,13 +122,13 @@ async def _try_ollama(content: str) -> str | None:
         return None
 
 
-async def _try_gemini(content: str) -> str | None:
+async def _try_gemini(content: str, system_prompt: str = SUMMARY_PROMPT) -> str | None:
     if not settings.GEMINI_API_KEY:
         return None
     try:
         import google.generativeai as genai
         genai.configure(api_key=settings.GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-2.0-flash", system_instruction=SUMMARY_PROMPT)
+        model = genai.GenerativeModel("gemini-2.0-flash", system_instruction=system_prompt)
         resp = await model.generate_content_async(content)
         return resp.text.strip()
     except Exception as e:
@@ -107,7 +136,7 @@ async def _try_gemini(content: str) -> str | None:
         return None
 
 
-async def _try_groq(content: str) -> str | None:
+async def _try_groq(content: str, system_prompt: str = SUMMARY_PROMPT, max_tokens: int = 300) -> str | None:
     if not settings.GROQ_API_KEY:
         return None
     try:
@@ -116,10 +145,10 @@ async def _try_groq(content: str) -> str | None:
         resp = await client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[
-                {"role": "system", "content": SUMMARY_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": content},
             ],
-            max_tokens=300,
+            max_tokens=max_tokens,
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:

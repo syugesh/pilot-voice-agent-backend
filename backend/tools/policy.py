@@ -10,8 +10,8 @@ logger = logging.getLogger("pilot.policy")
 
 ROLE_PERMS = {
     "admin":     set(["*"]),
-    "manager":   {"ppt_navigate","ppt_jump_to_title","ppt_summarize","ppt_edit_slide","ppt_generate_notes","ppt_last_action","ppt_add_slide","ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","travel_search","flight_book","general_qa","navigate_page"},
-    "csr":       {"ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","travel_search","flight_book","general_qa","navigate_page"},
+    "manager":   {"ppt_navigate","ppt_jump_to_title","ppt_summarize","ppt_edit_slide","ppt_generate_notes","ppt_last_action","ppt_add_slide","ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","travel_search","flight_book","general_qa","navigate_page","resolution_assess","escalate_ticket"},
+    "csr":       {"ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","travel_search","flight_book","general_qa","navigate_page","resolution_assess","escalate_ticket"},
     "operator":  {"ppt_navigate","ppt_jump_to_title","ppt_summarize","ppt_edit_slide","ppt_generate_notes","ppt_last_action","ppt_add_slide","general_qa","navigate_page"},
     "developer": {"ppt_navigate","ppt_jump_to_title","ppt_summarize","ppt_edit_slide","ppt_generate_notes","ppt_last_action","ppt_add_slide","kb_search","general_qa","navigate_page"},
     # "user" and "guest" = unrecognized/unenrolled speakers — allow basic navigation

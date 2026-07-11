@@ -230,8 +230,34 @@ class ASRWorker:
         }, turn.session_id)
 
         await _persist(span)
+        # Live customer-sentiment scoring for the CSR dashboard — only in the
+        # customer-care usecase, only for customer (non-PILOT) turns, and
+        # fire-and-forget so sentiment inference never delays routing the turn
+        # to the Front LLM.
+        try:
+            state = get_state(turn.session_id)
+            if getattr(state, "usecase", "") == "customercare" and (turn.role or "").upper() != "PILOT":
+                asyncio.create_task(_score_sentiment(turn.session_id, text, turn.timestamp))
+        except Exception as e:
+            logger.warning(f"sentiment dispatch skipped: {e}")
+
         await self.bus.transcript_q.put(span)
         await session_manager.transition(turn.session_id, SessionState.LISTENING)
+
+
+async def _score_sentiment(session_id: str, text: str, timestamp: float):
+    """Analyze one customer turn, store it on the session, and push a
+    sentiment_update to the CSR dashboard."""
+    from services.sentiment import sentiment_provider
+    from core.session_state import get_state
+    from queues.bus import bus
+    try:
+        result = await sentiment_provider.analyze(text)
+        result["timestamp"] = timestamp
+        get_state(session_id).add_sentiment(result)
+        await bus.emit_event("sentiment_update", result, session_id)
+    except Exception as e:
+        logger.warning(f"sentiment scoring failed: {e}")
 
 
 async def _persist(span: TranscriptSpan):

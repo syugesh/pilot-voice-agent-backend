@@ -102,7 +102,8 @@ Use ppt_add_slide when the user asks to add, insert, or create a NEW slide
 team") — this ADDS to the presentation, unlike ppt_edit_slide which only
 changes an EXISTING slide's content. instruction = what the new slide
 should be about (the whole request works fine as-is).
-CARE TOOLS: ticket_create, ticket_update, ticket_close, kb_search(query), crm_lookup, travel_search, flight_book
+CARE TOOLS: ticket_create, ticket_update, ticket_close, kb_search(query), crm_lookup, travel_search, flight_book, resolution_assess, escalate_ticket
+Use resolution_assess when the rep asks whether to escalate, what to do, how the call is going, or for a resolution/escalation recommendation ("should I escalate this?", "what's the recommendation?", "how likely can I resolve this?"). Use escalate_ticket to create an escalation ticket for the current issue.
 NAVIGATION: navigate_page(page: "dashboard"|"ppt"|"care"|"guidelines"|"about"|"profile"|"settings") — use when the user asks to go to, open, switch to, or be taken/redirected to one of the app's top-level pages (e.g. "take me to PPT Copilot", "open customer care", "go to the dashboard"). Never use for in-page requests like "go to slide 5".
 GENERAL: general_qa(query) — world knowledge, facts, concepts, definitions, science, "who is", "what is", "tell me", "explain", "how does", "why", "what does", "describe", "difference between"
 
@@ -251,6 +252,12 @@ _KEYWORDS = [
      {"action":"delegate","preamble":"Checking that for you!","tool":"travel_search","args":{},"mode":"queue"}),
     (["look up customer","find customer","customer details","crm"],
      {"action":"delegate","preamble":"Looking up that customer.","tool":"crm_lookup","args":{},"mode":"queue"}),
+    (["should i escalate","should we escalate","recommend escalation","what's the recommendation",
+      "what is the recommendation","assess this","resolution recommendation","escalate or resolve",
+      "can i resolve this","how's this call going","how is this call going"],
+     {"action":"delegate","preamble":"Assessing this call.","tool":"resolution_assess","args":{},"mode":"queue"}),
+    (["escalate this ticket","create an escalation","raise an escalation","escalate to l2"],
+     {"action":"delegate","preamble":"Creating an escalation ticket.","tool":"escalate_ticket","args":{},"mode":"queue"}),
 ]
 
 
@@ -346,6 +353,20 @@ class FrontLLMProvider:
     async def classify(self, text: str, speaker_id: str, role: str,
                        context: list, usecase: str = "general",
                        session_id: str = "") -> dict:
+        # Mid-clarification: ppt_add_slide asked "what should the new slide
+        # be about?" and is waiting for the answer on this very next turn.
+        # Route the whole utterance straight back to it rather than letting
+        # it get independently classified — otherwise an answer like "our
+        # Q4 roadmap" (no tool-shaped phrasing at all) falls through to
+        # general_qa or gets ignored, and the pending state never resolves.
+        # Checked before every other fast path, including page navigation,
+        # since completing an in-progress question takes priority.
+        if session_id:
+            from core.session_state import get_state
+            if get_state(session_id).pending_add_slide is not None:
+                return {"action": "delegate", "preamble": None,
+                        "tool": "ppt_add_slide", "args": {"instruction": text}, "mode": "queue"}
+
         # Page navigation — checked before anything usecase-specific so "go to
         # customer care" works from the PPT page and vice versa, not just from
         # whichever usecase's tool list happens to include navigate_page.
@@ -605,7 +626,7 @@ class FrontLLMProvider:
                         "args": {"query": text, "slide_number": num - 1},
                         "mode": "queue"}
 
-        _CARE_TOOLS = {"ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","travel_search","flight_book"}
+        _CARE_TOOLS = {"ticket_create","ticket_update","ticket_close","kb_search","crm_lookup","travel_search","flight_book","resolution_assess","escalate_ticket"}
 
         for keywords, response in _KEYWORDS:
             tool = response.get("tool", "")

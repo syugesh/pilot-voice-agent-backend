@@ -11,7 +11,7 @@ background/branding for that slide "kind") and swap its placeholder text
 for generated content, matched by the template's known placeholder text
 rather than by shape id/order (ids aren't stable across clones).
 """
-import asyncio, copy, datetime, json, logging, re
+import asyncio, contextvars, copy, datetime, json, logging, random, re
 from pptx import Presentation
 from pptx.oxml.ns import qn
 from lxml import etree
@@ -19,6 +19,7 @@ from lxml import etree
 logger = logging.getLogger("pilot.ppt_template_builder")
 
 TEMPLATE_PATH = "data/ppt_templates/GD_template/GD Presentation template.pptx"
+TEMPLATE_PATH_MINIMALIST = "data/ppt_templates/GD_template/Latest - GD Presentation Template – Minimalist Style.pptx"
 
 
 # ── Slide duplication / deletion — python-pptx has no public API for either ──
@@ -169,30 +170,35 @@ def _move_slide(prs, old_index: int, new_index: int):
 
 def add_slide_to_deck(pptx_path: str, kind: str, data: dict,
                        source_index_in_deck: int | None = None,
-                       insert_after: int | None = None,
-                       template_path: str = TEMPLATE_PATH) -> int:
+                       existing_source: str | None = None,
+                       insert_after: int | None = None) -> tuple[int, str | None]:
     """Insert one new populated slide of `kind` into an ALREADY-SAVED
     presentation (as opposed to build_deck_from_template, which always
     builds a fresh deck from scratch). If the caller already knows this deck
     contains a slide of the same kind (source_index_in_deck, looked up via
     the kinds sidecar in api/ppt.py), that slide is cloned directly — the
-    same well-tested same-document path used during initial generation.
-    Otherwise the slide is pulled from the pristine template instead.
-    Returns the new slide's final 0-indexed position.
+    same well-tested same-document path used during initial generation, and
+    it inherits that slide's recorded `existing_source` (its clone shares
+    the same shape_ids, so the same slot map applies). Otherwise a random
+    candidate is pulled fresh from the template pool (see _KIND_SOURCES) so
+    repeated "add a slide" calls don't all draw the same layout either.
+    Returns (new slide's final 0-indexed position, its source string).
     """
-    if kind not in _KIND_SOURCE_INDEX or kind not in _POPULATE:
+    if kind not in _KIND_SOURCES or kind not in _POPULATE:
         raise ValueError(f"Unknown slide kind: {kind!r}")
 
     prs = Presentation(pptx_path)
 
     if source_index_in_deck is not None:
         new_slide = _duplicate_slide(prs, source_index_in_deck)
+        source = existing_source
     else:
-        template_prs = Presentation(template_path)
-        new_slide = _copy_slide_from_external(prs, template_prs, _KIND_SOURCE_INDEX[kind])
+        source_path, source_index = pick_source(kind)
+        new_slide = _copy_slide_from_external(prs, _get_template_prs(source_path), source_index)
+        source = f"{source_path}::{source_index}"
 
     try:
-        _POPULATE[kind](new_slide, data)
+        populate_slide_data(new_slide, kind, data, _parse_source(source))
     except Exception as e:
         logger.error(f"Failed to populate new {kind!r} slide: {e}", exc_info=True)
 
@@ -204,8 +210,15 @@ def add_slide_to_deck(pptx_path: str, kind: str, data: dict,
             new_index = target_index
 
     prs.save(pptx_path)
-    logger.info(f"Added {kind!r} slide at index {new_index} → {pptx_path}")
-    return new_index
+    logger.info(f"Added {kind!r} slide at index {new_index} (source={source}) → {pptx_path}")
+    return new_index, source
+
+
+def _parse_source(source: str | None) -> tuple[str, int] | None:
+    if not source:
+        return None
+    path, _, idx = source.rpartition("::")
+    return (path, int(idx)) if path else None
 
 
 # ── Text helpers — locate + rewrite shapes by the template's known text ──────
@@ -321,22 +334,47 @@ def _resize_table(table, n_rows: int):
 # current content back out by shape_id, for the edit UI/voice tool) — no
 # fragile re-matching against already-overwritten text.
 
-_KIND_SOURCE_INDEX: dict[str, int] = {
-    "cover":        0,
-    "agenda":       6,
-    "text":         7,
-    "two_column":   9,
-    "comparison":   10,
-    "team":         11,
-    "speaker_1":    12,
-    "speaker_4":    13,
-    "text_blocks":  14,
-    "key_message":  19,
-    "table":        23,
-    "subsection":   24,
-    "chapter":      29,
-    "thank_you":    38,
+GD, MIN = TEMPLATE_PATH, TEMPLATE_PATH_MINIMALIST
+
+# Every candidate source slide for each kind, verified by actually running
+# that kind's locator against every slide in both template files and
+# checking every expected shape resolved (see _verify_kind_sources at the
+# bottom of this file) — not just "looks similar," since a locator that
+# only grabs the FIRST of several same-named marker shapes (e.g. "text"
+# matching only one of a two-column slide's two "Lorem Ipsum" bodies) would
+# silently leave the other one showing raw dummy template copy. A kind with
+# only one entry here had only one genuinely safe candidate; the rest were
+# excluded for that reason, not overlooked.
+_KIND_SOURCES: dict[str, list[tuple[str, int]]] = {
+    "cover":        [(GD,0),(GD,1),(GD,2),(GD,3),(GD,4),(GD,5),(MIN,0),(MIN,1)],
+    "agenda":       [(GD,6),(MIN,4)],
+    "text":         [(GD,7),(GD,8),(GD,30)],
+    "two_column":   [(GD,9),(GD,10)],
+    "comparison":   [(GD,9),(GD,10)],
+    "team":         [(GD,11),(GD,12),(GD,13),(MIN,3)],
+    "speaker_1":    [(GD,12),(GD,13)],
+    "speaker_4":    [(GD,13)],
+    "text_blocks":  [(GD,14)],
+    "key_message":  [(GD,19)],
+    "table":        [(GD,23),(GD,33),(GD,34),(GD,35)],
+    "subsection":   [(GD,24),(GD,25),(GD,27),(GD,28),(MIN,9)],
+    "chapter":      [(GD,29)],
+    "thank_you":    [(GD,38),(MIN,11)],
 }
+
+# Legacy fixed index per kind — the source every already-generated deck was
+# actually built with, before per-slide source tracking existed. Used as the
+# fallback when editing/extracting a slide whose sidecar has no recorded
+# source (see api/ppt.py's kinds vs sources sidecars).
+_KIND_SOURCE_INDEX: dict[str, int] = {
+    "cover": 0, "agenda": 6, "text": 7, "two_column": 9, "comparison": 10,
+    "team": 11, "speaker_1": 12, "speaker_4": 13, "text_blocks": 14,
+    "key_message": 19, "table": 23, "subsection": 24, "chapter": 29, "thank_you": 38,
+}
+
+
+def pick_source(kind: str) -> tuple[str, int]:
+    return random.choice(_KIND_SOURCES[kind])
 
 
 def _sid(shape):
@@ -466,15 +504,36 @@ _LOCATORS: dict[str, callable] = {
     "thank_you":    _locate_thank_you,
 }
 
-_SLOT_MAP_CACHE: dict[str, dict] = {}
+_SLOT_MAP_CACHE: dict[tuple, dict] = {}
+_TEMPLATE_PRS_CACHE: dict[str, "Presentation"] = {}
+
+# Which (template_path, index) a populate/extract call should read its slot
+# map from — set by the four entry points below (build_deck_from_template,
+# add_slide_to_deck, populate_slide_data, extract_slide_data) right before
+# dispatching into _POPULATE[kind]/_EXTRACT[kind]. Reading it inside
+# get_slot_map (rather than threading a `source` parameter through all 28
+# _populate_*/_extract_* functions) means none of those functions need to
+# change at all — they already just call get_slot_map(kind) as before.
+# ContextVar (not a plain module global) so concurrent requests running in
+# different asyncio.to_thread workers never see each other's source.
+_current_source: contextvars.ContextVar[tuple | None] = contextvars.ContextVar("current_source", default=None)
+
+
+def _get_template_prs(template_path: str):
+    if template_path not in _TEMPLATE_PRS_CACHE:
+        _TEMPLATE_PRS_CACHE[template_path] = Presentation(template_path)
+    return _TEMPLATE_PRS_CACHE[template_path]
 
 
 def get_slot_map(kind: str) -> dict:
-    if kind not in _SLOT_MAP_CACHE:
-        prs = Presentation(TEMPLATE_PATH)
-        slide = prs.slides[_KIND_SOURCE_INDEX[kind]]
-        _SLOT_MAP_CACHE[kind] = _LOCATORS[kind](slide)
-    return _SLOT_MAP_CACHE[kind]
+    source = _current_source.get() or (TEMPLATE_PATH, _KIND_SOURCE_INDEX[kind])
+    cache_key = (kind, source)
+    if cache_key not in _SLOT_MAP_CACHE:
+        template_path, index = source
+        prs = _get_template_prs(template_path)
+        slide = prs.slides[index]
+        _SLOT_MAP_CACHE[cache_key] = _LOCATORS[kind](slide)
+    return _SLOT_MAP_CACHE[cache_key]
 
 
 def _shape_by_id(slide, shape_id):
@@ -930,35 +989,65 @@ KIND_FIELD_SCHEMA: dict[str, list[dict]] = {
 }
 
 
-def extract_slide_data(slide, kind: str) -> dict:
+def extract_slide_data(slide, kind: str, source: tuple[str, int] | None = None) -> dict:
     fn = _EXTRACT.get(kind)
-    return fn(slide) if fn else {}
+    if not fn:
+        return {}
+    token = _current_source.set(source)
+    try:
+        return fn(slide)
+    finally:
+        _current_source.reset(token)
 
 
-def populate_slide_data(slide, kind: str, data: dict):
+def populate_slide_data(slide, kind: str, data: dict, source: tuple[str, int] | None = None):
     fn = _POPULATE.get(kind)
-    if fn:
+    if not fn:
+        return
+    token = _current_source.set(source)
+    try:
         fn(slide, data)
+    finally:
+        _current_source.reset(token)
 
 
-def build_deck_from_template(content: dict, out_path: str, template_path: str = TEMPLATE_PATH):
+def build_deck_from_template(content: dict, out_path: str, template_path: str = TEMPLATE_PATH) -> list[str | None]:
+    """Builds the deck and returns the per-slide source used (as
+    "path::index" strings, same order as the final deck) so the caller can
+    persist it — a later edit needs to know exactly which candidate slide a
+    given kind was cloned from to compute the matching slot map, since
+    different candidates for the same kind don't share shape_ids.
+    """
+    # A fresh copy to mutate — _get_template_prs's cached Presentation
+    # objects are reused as cross-copy SOURCES for every generation call
+    # and must stay pristine.
     prs = Presentation(template_path)
     original_count = len(prs.slides)
+    sources_used: list[str | None] = []
 
     for slide_data in content.get("slides", []):
         kind = slide_data.get("kind")
-        if kind not in _KIND_SOURCE_INDEX or kind not in _POPULATE:
+        if kind not in _KIND_SOURCES or kind not in _POPULATE:
             logger.warning(f"Unknown slide kind {kind!r}, skipping")
+            sources_used.append(None)  # keep 1:1 alignment with content["slides"] / the kinds sidecar
             continue
-        new_slide = _duplicate_slide(prs, _KIND_SOURCE_INDEX[kind])
+        source = pick_source(kind)
+        source_path, source_index = source
+        if source_path == template_path:
+            new_slide = _duplicate_slide(prs, source_index)
+        else:
+            new_slide = _copy_slide_from_external(prs, _get_template_prs(source_path), source_index)
         try:
-            _POPULATE[kind](new_slide, slide_data)
+            populate_slide_data(new_slide, kind, slide_data, source)
+            sources_used.append(f"{source_path}::{source_index}")
         except Exception as e:
             logger.error(f"Failed to populate {kind!r} slide: {e}", exc_info=True)
+            sources_used.append(None)
 
     _strip_original_slides(prs, original_count)
     prs.save(out_path)
     logger.info(f"Built {len(prs.slides)} slides from GD template → {out_path}")
+    return sources_used
 
 
 # ── Content generation — Ollama fills in a kind-aware slide schema ───────────

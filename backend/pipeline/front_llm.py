@@ -64,6 +64,10 @@ class FrontLLMWorker:
             from core.cancel_tokens import cancel_tts, cancel_all_bg
             cancel_tts()
             cancel_all_bg()
+            # A pending "what should the new slide be about?" question must
+            # not silently hijack whatever the user says next once they've
+            # explicitly backed out of it.
+            get_state(span.session_id).pending_add_slide = None
             # Always tell the frontend to stop playback — the backend TTS task may
             # already be done (audio was sent as one blob) so CancelledError won't fire.
             await self.bus.emit_event("tts_stop", {}, span.session_id)
@@ -179,6 +183,9 @@ _ARG_SCHEMA: dict[str, dict[str, tuple]] = {
     "ticket_update":     {"ticket_id": (str, 40), "status": (str, 30), "note": (str, 300)},
     "ticket_close":      {"ticket_id": (str, 40), "resolution": (str, 300)},
     "crm_lookup":        {"query": (str, 150)},
+    "resolution_assess": {"query": (str, 500)},
+    "escalate_ticket":   {"synopsis": (str, 300), "category": (str, 50), "symptoms": (str, 500),
+                          "priority": (str, 20), "escalation_target": (str, 40)},
     "general_qa":        {"query": (str, 400)},
     "ppt_navigate":      {"direction": (str, 10)},
     "ppt_jump_to_title": {"query": (str, 200), "slide_number": (int, None)},

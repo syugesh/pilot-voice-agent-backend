@@ -25,4 +25,7 @@ class WSEvent:
 # tool_blocked      → {tool, speaker, reason}
 # route_decision    → {action, tool, speaker}
 # session_state     → {state}
+# sentiment_update  → {sentiment, sentiment_score, frustration_score, urgency, timestamp}
+# resolution_update → {resolution_confidence, recommendation, reasoning, escalation_target,
+#                      escalation_reasons[], issue_summary, kb_articles[], signals}
 # ping              → {}

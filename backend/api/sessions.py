@@ -97,6 +97,63 @@ async def list_sessions(db: AsyncSession = Depends(get_db)):
     return {"sessions": sessions}
 
 
+@router.get("/stats")
+async def session_stats(db: AsyncSession = Depends(get_db)):
+    """Aggregate dashboard tiles — sessions/transcripts/tools today vs
+    yesterday, and today's average tool latency. Real SQL aggregation over
+    Session/TranscriptLog/AuditLog, not client-derived estimates, since the
+    dashboard only ever sees the last 20 sessions via /list."""
+    import datetime
+    from sqlalchemy import func
+
+    now = datetime.datetime.utcnow()
+    today_start = datetime.datetime(now.year, now.month, now.day)
+    yesterday_start = today_start - datetime.timedelta(days=1)
+
+    async def _count_since(model, ts_col, since, until=None):
+        q = select(func.count()).select_from(model).where(ts_col >= since)
+        if until is not None:
+            q = q.where(ts_col < until)
+        return (await db.execute(q)).scalar() or 0
+
+    def _delta_pct(today: int, yesterday: int) -> float | None:
+        if yesterday == 0:
+            return None  # avoid a misleading "+inf%" — frontend shows "—" instead
+        return round((today - yesterday) / yesterday * 100, 1)
+
+    sessions_today     = await _count_since(PilotSession, PilotSession.created_at, today_start)
+    sessions_yesterday = await _count_since(PilotSession, PilotSession.created_at, yesterday_start, today_start)
+
+    transcripts_today     = await _count_since(TranscriptLog, TranscriptLog.created_at, today_start)
+    transcripts_yesterday = await _count_since(TranscriptLog, TranscriptLog.created_at, yesterday_start, today_start)
+
+    tools_today = (await db.execute(
+        select(func.count()).select_from(AuditLog)
+        .where(AuditLog.action == "tool_call", AuditLog.timestamp >= today_start)
+    )).scalar() or 0
+    tools_yesterday = (await db.execute(
+        select(func.count()).select_from(AuditLog)
+        .where(AuditLog.action == "tool_call", AuditLog.timestamp >= yesterday_start, AuditLog.timestamp < today_start)
+    )).scalar() or 0
+
+    avg_latency_today = (await db.execute(
+        select(func.avg(AuditLog.latency_ms)).select_from(AuditLog)
+        .where(AuditLog.action == "tool_call", AuditLog.timestamp >= today_start, AuditLog.latency_ms.is_not(None))
+    )).scalar()
+    avg_latency_yesterday = (await db.execute(
+        select(func.avg(AuditLog.latency_ms)).select_from(AuditLog)
+        .where(AuditLog.action == "tool_call", AuditLog.timestamp >= yesterday_start, AuditLog.timestamp < today_start, AuditLog.latency_ms.is_not(None))
+    )).scalar()
+
+    return {
+        "sessions_today": sessions_today, "sessions_delta_pct": _delta_pct(sessions_today, sessions_yesterday),
+        "transcripts_today": transcripts_today, "transcripts_delta_pct": _delta_pct(transcripts_today, transcripts_yesterday),
+        "tools_today": tools_today, "tools_delta_pct": _delta_pct(tools_today, tools_yesterday),
+        "avg_latency_ms": round(avg_latency_today) if avg_latency_today is not None else None,
+        "avg_latency_ms_yesterday": round(avg_latency_yesterday) if avg_latency_yesterday is not None else None,
+    }
+
+
 @router.get("/{session_id}/history")
 async def session_history(session_id: str, db: AsyncSession = Depends(get_db)):
     """Return session info + transcript + audit actions for the history popup."""

@@ -56,9 +56,10 @@ class _VADState:
         "in_speech", "buffer", "speech_start", "silence_cnt", "speech_cnt",
         "prob_sum", "rms_sum", "rms_n", "rms_min", "rms_max",
         # Streaming diarization fields
-        "embed_win_buf",    # frames accumulating for the next embedding window
-        "embed_win_cnt",    # speech-frame count in current window
-        "embed_futures",    # list of (start_sec_into_turn, asyncio.Task)
+        "embed_win_buf",    
+        "embed_win_cnt",    
+        "embed_futures",    
+        "barge_in_candidate_frames",  # NEW: Tracks consecutive frames for fast barge-in
     )
     def __init__(self):
         self.in_speech    = False
@@ -66,14 +67,15 @@ class _VADState:
         self.speech_start = 0.0
         self.silence_cnt  = 0
         self.speech_cnt   = 0
-        self.prob_sum     = 0.0   # accumulated speech probability (neural)
-        self.rms_sum      = 0.0   # accumulated RMS (fallback)
+        self.prob_sum     = 0.0   
+        self.rms_sum      = 0.0   
         self.rms_n        = 0
         self.rms_min      = 1e9
         self.rms_max      = 0.0
         self.embed_win_buf:   list[bytes] = []
         self.embed_win_cnt:   int         = 0
-        self.embed_futures:   list        = []  # (start_sec, asyncio.Task)
+        self.embed_futures:   list        = []  
+        self.barge_in_candidate_frames: int = 0  # NEW
 
 
 # ── Main worker ───────────────────────────────────────────────────────────────

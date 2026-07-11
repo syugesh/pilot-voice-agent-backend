@@ -9,6 +9,7 @@ from tools.knowledge import kb_search
 from tools.crm import crm_lookup
 from tools.general_qa import general_qa
 from tools.navigation import navigate_page
+from tools.resolution_tool import resolution_assess, escalate_ticket
 
 TOOL_REGISTRY: dict = {
     "ppt_navigate":      ppt_navigate,
@@ -28,4 +29,6 @@ TOOL_REGISTRY: dict = {
     "flight_book":       flight_book,
     "general_qa":        general_qa,
     "navigate_page":     navigate_page,
+    "resolution_assess": resolution_assess,
+    "escalate_ticket":   escalate_ticket,
 }

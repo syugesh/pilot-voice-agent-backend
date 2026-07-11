@@ -27,6 +27,14 @@ async def startup_pipeline():
     from services.enrollment import embed_provider
     asyncio.create_task(asyncio.to_thread(embed_provider.load), name="WeSpeakerWarmup")
 
+    # Warm the customer-care intelligence models + build the KB vector index
+    # now (seeds the KB docs on first run), so the first CSR call doesn't eat
+    # the model-load + embed cost mid-conversation.
+    from services.kb_index import kb_index
+    from services.sentiment import sentiment_provider
+    asyncio.create_task(kb_index.build_from_db(), name="KBIndexBuild")
+    asyncio.create_task(asyncio.to_thread(sentiment_provider.load), name="SentimentWarmup")
+
     workers = [
         SileroVADWorker(bus),
         SmartTurnWorker(bus),

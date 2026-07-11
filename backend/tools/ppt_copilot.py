@@ -1,6 +1,44 @@
 """PPT tools — navigate + jump to slide by number or title + summarize."""
-import asyncio, logging
+import asyncio, logging, re
 logger = logging.getLogger("pilot.tools.ppt")
+
+
+# ── Add-slide helpers — parse "where" out of the instruction, and detect
+# when "what" was never actually said (so we ask instead of hallucinating
+# generic filler content that only coincidentally resembles a real slide) ──
+
+def _parse_insert_position(text: str) -> tuple[int | None, bool]:
+    """Returns (insert_after, was_specified). insert_after is 0-indexed —
+    the new slide lands right after prs.slides[insert_after]. None means
+    "append at the end", which is also the default when nothing was said."""
+    t = text.lower()
+    m = re.search(r'\bafter\s+slide\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
+    if m:
+        return int(m.group(1)) - 1, True
+    m = re.search(r'\bbefore\s+slide\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
+    if m:
+        return int(m.group(1)) - 2, True  # before slide N == after slide N-1
+    if re.search(r'\b(?:at the (?:beginning|start)|as the first slide|to the front)\b', t):
+        return -1, True
+    if re.search(r'\b(?:at the end|as the last slide)\b', t):
+        return None, True
+    return None, False
+
+
+_ADD_SLIDE_FILLER = {
+    "add", "insert", "create", "make", "put", "a", "an", "the", "new", "slide", "slides",
+    "please", "can", "you", "could", "would", "for", "me", "to", "us", "we", "want",
+    "need", "like", "and", "one", "here", "in", "presentation", "deck",
+}
+
+def _has_real_topic(text: str) -> bool:
+    """False when the instruction is just the trigger phrase itself ("add a
+    slide", "create a new slide") with no actual subject — the case that
+    used to get sent straight to content generation, which doesn't fail on
+    a topic-less prompt, it just invents plausible-sounding filler."""
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    meaningful = [w for w in words if w not in _ADD_SLIDE_FILLER and not w.isdigit()]
+    return len(meaningful) >= 2
 
 
 async def ppt_navigate(args: dict, session_id: str) -> dict:
@@ -199,7 +237,7 @@ async def ppt_edit_slide(args: dict, session_id: str) -> dict:
     # fall straight through to the unchanged generic path below.
     kind = slide.get("kind")
     if kind:
-        return await _edit_kind_aware_slide(effective_sid, idx, kind, instruction, session_id)
+        return await _edit_kind_aware_slide(effective_sid, idx, kind, instruction, session_id, slide.get("source"))
 
     # Extract bullets
     old_bullets = []
@@ -372,21 +410,28 @@ Output ONLY valid JSON matching this schema:
         return {"spoken_reply": "I had trouble editing the slide right now."}
 
 
-async def _edit_kind_aware_slide(effective_sid: str, idx: int, kind: str, instruction: str, session_id: str) -> dict:
+async def _edit_kind_aware_slide(effective_sid: str, idx: int, kind: str, instruction: str, session_id: str, source: str | None = None) -> dict:
     """
     Voice-edit path for slides cloned from the GD template (team, table,
     comparison, ...) — the generic title/numbered-bullets model above
     doesn't fit their structure at all. Same "send current state as JSON,
     ask the model for edited JSON back" pattern as the generic path, just
     with each kind's own field schema instead of title/bullets/notes.
+
+    `source` identifies exactly which candidate slide (of possibly several
+    for this kind — see _KIND_SOURCES) this one was originally cloned from;
+    different candidates don't share shape_ids, so it's needed to compute
+    the right slot map, not just the kind name.
     """
-    from services.ppt_template_builder import extract_slide_data, populate_slide_data
+    from services.ppt_template_builder import extract_slide_data, populate_slide_data, _parse_source
     import json
+
+    parsed_source = _parse_source(source)
 
     def _read_current() -> dict:
         from pptx import Presentation
         prs = Presentation(f"data/ppt/{effective_sid}.pptx")
-        return extract_slide_data(prs.slides[idx], kind)
+        return extract_slide_data(prs.slides[idx], kind, parsed_source)
 
     try:
         current_data = await asyncio.to_thread(_read_current)
@@ -437,7 +482,7 @@ Rules:
             return {"spoken_reply": "I had trouble understanding that edit — could you try rephrasing it?"}
 
         def _writer(slide):
-            populate_slide_data(slide, kind, new_data)
+            populate_slide_data(slide, kind, new_data, parsed_source)
 
         await _apply_edit_and_background_refresh(effective_sid, idx, session_id, _writer)
         from core.session_state import get_state
@@ -559,37 +604,62 @@ async def ppt_generate_notes(args: dict, session_id: str) -> dict:
 
 async def ppt_add_slide(args: dict, session_id: str) -> dict:
     """Insert a new slide into the loaded presentation, content generated
-    from a spoken description ("add a slide about our Q4 roadmap"). Falls
-    back to a plain title-only text slide if generation fails or no
-    description was given, rather than failing the whole command."""
+    from a spoken description ("add a slide about our Q4 roadmap [after
+    slide 3]"). If the instruction has no real topic ("add a slide" with
+    nothing else), asks what it should be about instead of sending that
+    bare trigger phrase to content generation — which doesn't fail on a
+    topic-less prompt, it just invents plausible-sounding filler that reads
+    as if the system "hallucinated" or echoed something already in the
+    deck. The clarifying answer is picked up on the next turn via
+    state.pending_add_slide (see services/front_llm.py's classify())."""
     from api.ppt import _slide_store, _latest_upload_sid
     from services.ppt_template_builder import generate_single_slide_content
+    from core.session_state import get_state
 
     effective_sid = session_id if session_id in _slide_store else _latest_upload_sid
     slides = _slide_store.get(effective_sid, [])
     if not slides:
         return {"spoken_reply": "No presentation is loaded yet. Please upload or create one first."}
 
+    state = get_state(session_id)
+    pending = state.pending_add_slide
     instruction = args.get("instruction", "").strip()
-    slide_data = None
-    if instruction:
-        try:
-            slide_data = await generate_single_slide_content(instruction)
-        except Exception as e:
-            logger.error(f"ppt_add_slide generation error: {e}")
+
+    insert_after, position_specified = _parse_insert_position(instruction)
+    if pending is not None and not position_specified:
+        # Position was already settled in the question that led to this
+        # follow-up turn (or deliberately left as "append at the end").
+        insert_after = pending.get("insert_after")
+
+    if not _has_real_topic(instruction):
+        if pending is not None:
+            # Already asked once this round and still got nothing to go on
+            # — don't loop forever asking the same question.
+            state.pending_add_slide = None
+            return {"spoken_reply": "I still didn't catch what the slide should be about, so I'll leave it for now — just ask again whenever you're ready."}
+        state.pending_add_slide = {"insert_after": insert_after}
+        where = "" if insert_after is None else (
+            "at the very beginning" if insert_after == -1 else f"right after slide {insert_after + 1}"
+        )
+        return {"spoken_reply": f"Sure — what should the new slide be about?" + (f" I'll put it {where}." if where else "")}
+
+    state.pending_add_slide = None
+
+    try:
+        slide_data = await generate_single_slide_content(instruction)
+    except Exception as e:
+        logger.error(f"ppt_add_slide generation error: {e}")
+        slide_data = None
 
     if not slide_data:
-        title = instruction[:60] if instruction else "New Slide"
-        slide_data = {"kind": "text", "title": title, "paragraphs": []}
+        slide_data = {"kind": "text", "title": instruction[:60], "paragraphs": []}
 
     kind = slide_data.pop("kind")
 
     try:
-        ok = await _apply_add_and_background_refresh(effective_sid, kind, slide_data, session_id)
+        ok = await _apply_add_and_background_refresh(effective_sid, kind, slide_data, session_id, insert_after)
         if not ok:
             return {"spoken_reply": "I couldn't add a slide right now."}
-        from core.session_state import get_state
-        state = get_state(session_id)
         state.last_ppt_action = {
             "tool": "ppt_add_slide",
             "slide_number": len(slides) + 1,
@@ -602,7 +672,7 @@ async def ppt_add_slide(args: dict, session_id: str) -> dict:
         return {"spoken_reply": "I had trouble adding that slide."}
 
 
-async def _apply_add_and_background_refresh(effective_sid: str, kind: str, data: dict, session_id: str) -> bool:
+async def _apply_add_and_background_refresh(effective_sid: str, kind: str, data: dict, session_id: str, insert_after: int | None = None) -> bool:
     """Same fast-reply-then-background-refresh pattern as
     _apply_edit_and_background_refresh, for the add-slide path: writes the
     new slide immediately, then regenerates thumbnails (LibreOffice, whole
@@ -611,7 +681,7 @@ async def _apply_add_and_background_refresh(effective_sid: str, kind: str, data:
     from api.ppt import add_slide_fast_async, refresh_slide_thumbnails_async
     from queues.bus import bus
 
-    new_index = await add_slide_fast_async(effective_sid, kind, data)
+    new_index = await add_slide_fast_async(effective_sid, kind, data, insert_after)
     if new_index is None:
         return False
 
