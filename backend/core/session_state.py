@@ -40,6 +40,15 @@ class SessionPipelineState:
     # (a single spike isn't an escalation signal; a trend is). Capped small;
     # not persisted to the DB snapshot (live-call state, not history).
     sentiment_history: list = field(default_factory=list)
+    # Identity-bound confirmation for a destructive tool (ticket_close,
+    # flight_book, ...). Set by PolicyGate._confirm() while it waits; the
+    # NEXT utterance in this session is checked against it (see
+    # pipeline/front_llm.py's confirmation-reply gate) before normal LLM
+    # routing even runs — an affirmative from anyone other than
+    # `speaker_id` must not resolve it. Not persisted: a stale confirmation
+    # request shouldn't survive a reconnect and silently fire later.
+    # {"tool": str, "speaker_id": str|None, "event": asyncio.Event, "resolved": bool}
+    pending_confirm: Optional[dict] = None
 
     def add_sentiment(self, entry: dict):
         self.sentiment_history.append(entry)

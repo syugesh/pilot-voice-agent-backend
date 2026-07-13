@@ -28,4 +28,6 @@ class WSEvent:
 # sentiment_update  → {sentiment, sentiment_score, frustration_score, urgency, timestamp}
 # resolution_update → {resolution_confidence, recommendation, reasoning, escalation_target,
 #                      escalation_reasons[], issue_summary, kb_articles[], signals}
+# care_observe      → {synopsis, symptom_timeline[], turn_count}  (silent observer, customercare)
+# agent_note        → {text}  (ReAct worker conclusion, routed silently to the CSR dashboard)
 # ping              → {}

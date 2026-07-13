@@ -105,7 +105,10 @@ async def _try_ollama(query: str, web_context: str | None = None) -> str | None:
                 return response["message"]["content"].strip()
             return response.message.content.strip()
 
-        reply = await asyncio.to_thread(_call)
+        # Low priority: yields the Ollama slot to Front-LLM routing so a long
+        # answer doesn't starve the next voice turn's classify.
+        from core.llm_gate import ollama_gate
+        reply = await ollama_gate.run(_call, priority="low", label="general_qa")
         logger.info(f"Ollama general_qa ok: {reply[:60]}")
         return reply
     except Exception as e:

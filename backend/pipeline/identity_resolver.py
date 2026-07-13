@@ -3,6 +3,23 @@ from queues.bus import QueueBus, LabeledTurn
 
 logger = logging.getLogger("pilot.identity")
 
+# Below this cosine score, a failed match isn't "probably the session owner,
+# just noisy audio" — it's a genuinely different voice. The JWT fallback
+# (session owner's real name/role) must only apply in the former case; a
+# distinct unenrolled speaker (e.g. a customer on the same call) must never
+# be labeled with the session owner's identity just because they're the one
+# who happened to be logged in when the session started.
+_OWN_VOICE_PLAUSIBLE_SCORE = 0.45
+
+
+def _unknown_label(usecase: str | None) -> str:
+    # Customer-care sessions know their second-voice role by convention —
+    # anyone unenrolled on that call is the customer, not a generic unknown.
+    if (usecase or "").lower() == "customercare":
+        return "Customer"
+    return "Unknown Speaker"
+
+
 class IdentityResolverWorker:
     def __init__(self, bus: QueueBus):
         self.bus = bus
@@ -32,18 +49,32 @@ class IdentityResolverWorker:
                         turn.speaker_id = speaker_id
                         turn.role = role
                         turn.confidence = confidence
-                    else:
-                        # Voice ID failed — fall back to the JWT-authenticated user's identity
+                    elif confidence >= _OWN_VOICE_PLAUSIBLE_SCORE and state.fallback_name:
+                        # Close-but-below-threshold match, and this session has a
+                        # known logged-in owner — most likely the owner's own
+                        # voice on a quiet/noisy turn, not a second person.
                         fallback = state.fallback_role or "user"
                         turn.speaker_id = state.fallback_name or "You"
                         turn.role = fallback
                         turn.confidence = confidence
-                        logger.info(f"[{turn.session_id[:8]}] Voice ID failed ({msg}) — "
-                                    f"falling back to logged-in identity {turn.speaker_id!r} role={fallback!r}")
+                        logger.info(f"[{turn.session_id[:8]}] Voice ID inconclusive ({msg}, "
+                                    f"score={confidence:.2f}) — plausibly the logged-in owner, "
+                                    f"using {turn.speaker_id!r} role={fallback!r}")
+                    else:
+                        # Score too low to plausibly be the session owner (or no
+                        # owner identity known at all) — this is a different,
+                        # unenrolled physical speaker. Label them as such rather
+                        # than guessing an identity that isn't theirs.
+                        turn.speaker_id = _unknown_label(state.usecase)
+                        turn.role = "customer" if turn.speaker_id == "Customer" else "guest"
+                        turn.confidence = confidence
+                        logger.info(f"[{turn.session_id[:8]}] Voice ID failed ({msg}, "
+                                    f"score={confidence:.2f}) — labeling as {turn.speaker_id!r}, "
+                                    f"NOT the logged-in owner")
             except Exception as e:
                 logger.error(f"Identity error: {e}")
-                turn.speaker_id = state.fallback_name or "You"
-                turn.role = "user"
-                turn.confidence = 0.8
+                turn.speaker_id = _unknown_label(state.usecase)
+                turn.role = "customer" if turn.speaker_id == "Customer" else "guest"
+                turn.confidence = 0.0
 
             await self.bus.labeled_turn_q.put(turn)   # ← writes labeled_turn_q

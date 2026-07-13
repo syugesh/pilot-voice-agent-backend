@@ -230,18 +230,33 @@ class ASRWorker:
         }, turn.session_id)
 
         await _persist(span)
+
+        state = get_state(turn.session_id)
+        usecase = getattr(state, "usecase", "") or ""
+
         # Live customer-sentiment scoring for the CSR dashboard — only in the
         # customer-care usecase, only for customer (non-PILOT) turns, and
-        # fire-and-forget so sentiment inference never delays routing the turn
-        # to the Front LLM.
+        # fire-and-forget so sentiment inference never delays the turn.
         try:
-            state = get_state(turn.session_id)
-            if getattr(state, "usecase", "") == "customercare" and (turn.role or "").upper() != "PILOT":
+            if usecase == "customercare" and (turn.role or "").upper() != "PILOT":
                 asyncio.create_task(_score_sentiment(turn.session_id, text, turn.timestamp))
         except Exception as e:
             logger.warning(f"sentiment dispatch skipped: {e}")
 
-        await self.bus.transcript_q.put(span)
+        if usecase == "customercare":
+            # PILOT is a SILENT observer here, not a conversation participant:
+            # it must never speak, ask clarifying questions, or route the
+            # rep/customer's speech into voice-assistant tools (all of which
+            # the Front LLM path does). So the span is NOT put on transcript_q
+            # (which drives classify → speak/delegate). Instead it feeds the
+            # background field-extractor that updates the dashboard only.
+            from services.care_observer import observe
+            observe(turn.session_id, usecase)
+        else:
+            # Conversational modes (ppt, general): PILOT talks back — route the
+            # turn to the Front LLM for classification + TTS as before.
+            await self.bus.transcript_q.put(span)
+
         await session_manager.transition(turn.session_id, SessionState.LISTENING)
 
 

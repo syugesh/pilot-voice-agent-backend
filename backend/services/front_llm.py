@@ -94,7 +94,8 @@ CRITICAL — DO NOT fake answers in preamble:
   GOOD: {"action":"delegate","preamble":"Let me explain that!","tool":"general_qa","args":{"query":"..."}}
 The preamble is just a brief acknowledgment. The tool produces the real answer.
 
-PPT TOOLS: ppt_navigate(direction:next|prev|first|last), ppt_jump_to_title(query,slide_number), ppt_summarize(), ppt_delete_slide(slide_number?), ppt_edit_slide(instruction), ppt_generate_notes(slide_number?, all?), ppt_add_slide(instruction)
+PPT TOOLS: ppt_navigate(direction:next|prev|first|last), ppt_jump_to_title(query,slide_number), ppt_summarize(), ppt_delete_slide(slide_number?), ppt_edit_slide(instruction), ppt_generate_notes(slide_number?, all?), ppt_add_slide(instruction), ppt_reorder_slide(instruction)
+"move slide 1 after slide 3" / "reorder slide 2 to position 5" → ppt_reorder_slide(instruction=<full text>)
 "delete slide 10" → ppt_delete_slide(slide_number=9)   "delete this slide" → ppt_delete_slide()
 NEVER route delete/remove commands to ppt_jump_to_title or ppt_navigate.
 Use ppt_add_slide when the user asks to add, insert, or create a NEW slide
@@ -311,14 +312,20 @@ def _get_ollama_client():
     return _ollama_client
 
 
+# Resolved at load() — the small routing model if it's pulled, else the main
+# model. Routing runs on this so it stays fast while the big model is busy.
+_classify_model = settings.CLASSIFY_MODEL
+
+
 def _ollama_chat_sync(messages: list[dict]) -> str:
     """Blocking ollama.chat() — called via asyncio.to_thread() to avoid blocking the loop."""
     client = _get_ollama_client()
     response = client.chat(
-        model=settings.OLLAMA_MODEL,
+        model=_classify_model,
         messages=messages,
         think=False,               # disable Qwen3 thinking — cuts ~50s off latency
         options={"num_predict": 200},  # headroom for full delegate JSON (preamble+tool+args+mode)
+        keep_alive="30m",          # keep the routing model resident between turns
         stream=False,
     )
     # Support both dict and attribute access (ollama package version differences)
@@ -334,18 +341,48 @@ class FrontLLMProvider:
         self._available = False
 
     def load(self):
+        global _classify_model
         try:
             import ollama, httpx
             r = httpx.get(f"{settings.OLLAMA_BASE_URL}/api/tags", timeout=4.0)
             available = [m["name"] for m in r.json().get("models", [])]
-            if any(settings.OLLAMA_MODEL in n for n in available):
+
+            # Prefer the small routing model; fall back to the main model if it
+            # isn't pulled (so this change never breaks a working install).
+            if any(settings.CLASSIFY_MODEL in n for n in available):
+                _classify_model = settings.CLASSIFY_MODEL
+            elif any(settings.OLLAMA_MODEL in n for n in available):
+                _classify_model = settings.OLLAMA_MODEL
+                logger.warning(
+                    f"Classify model '{settings.CLASSIFY_MODEL}' not pulled — routing on "
+                    f"'{settings.OLLAMA_MODEL}' instead. For faster routing under load: "
+                    f"ollama pull {settings.CLASSIFY_MODEL}"
+                )
+
+            if any(settings.OLLAMA_MODEL in n for n in available) or any(settings.CLASSIFY_MODEL in n for n in available):
                 self._available = True
-                logger.info(f"Ollama ready → {settings.OLLAMA_MODEL}")
+                logger.info(f"Ollama ready → classify={_classify_model}, heavy={settings.OLLAMA_MODEL}")
+                # Warm the routing model into memory now (a real inference — the
+                # /api/tags check above doesn't load weights). Without this, the
+                # FIRST voice turn pays a multi-second cold load and can trip the
+                # classify timeout. Uses a long-lived keep_alive so it stays
+                # resident between turns rather than unloading after each call.
+                try:
+                    # Own client with a generous timeout — the cold weight load
+                    # can exceed the tight per-turn classify timeout.
+                    ollama.Client(host=settings.OLLAMA_BASE_URL, timeout=90.0).chat(
+                        model=_classify_model,
+                        messages=[{"role": "user", "content": "ok"}],
+                        think=False, options={"num_predict": 1}, keep_alive="30m", stream=False,
+                    )
+                    logger.info(f"Classify model '{_classify_model}' warmed and resident")
+                except Exception as e:
+                    logger.warning(f"Classify warmup skipped ({e})")
             else:
                 logger.warning(
-                    f"Ollama running but '{settings.OLLAMA_MODEL}' not pulled. "
-                    f"Run: ollama pull {settings.OLLAMA_MODEL}  "
-                    f"(available: {available})"
+                    f"Ollama running but neither '{settings.CLASSIFY_MODEL}' nor "
+                    f"'{settings.OLLAMA_MODEL}' is pulled. "
+                    f"Run: ollama pull {settings.OLLAMA_MODEL}  (available: {available})"
                 )
         except Exception as e:
             logger.warning(f"Ollama not reachable at {settings.OLLAMA_BASE_URL}: {e} — keyword fallback active")
@@ -398,6 +435,28 @@ class FrontLLMProvider:
                 or re.search(r'\bmake\s+slide[s]?\s*(?:number|no\.?|#)?\s*\d+\b', _tl) is not None
             )
             _is_notes_edit = "notes" in _tl and any(w in _tl for w in ("generate", "create", "write", "add"))
+            # Reorder — "move/reorder/rearrange slide X after/before/to Y".
+            # A real reorder names a SPECIFIC slide to move ("move slide 1 ...").
+            # NOT navigation like "move to the last slide" / "move to slide 5",
+            # which is just "go to" phrasing — those must fall through to the
+            # deterministic slide-navigation path below, not the reorder tool.
+            # We gate on the reorder parser actually finding a source+target so
+            # the fast path can't misfire on nav phrasing.
+            _has_reorder_verb = re.search(r'\b(?:reorder|rearrange|swap|reposition|shift)\b', _tl) is not None
+            # "move" only counts as reorder when it targets a specific slide to
+            # move, i.e. "move slide N ..." — never "move to ...".
+            _ord_words = "first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth"
+            _move_specific_slide = re.search(
+                r'\bmove\s+(?:the\s+)?(?:slide[s]?\s*(?:number|no\.?|#)?\s*\d+|(?:'
+                + _ord_words + r')\s+slide)\b', _tl) is not None
+            if usecase == "ppt" and (_has_reorder_verb or _move_specific_slide) and "slide" in _tl:
+                from tools.ppt_copilot import _parse_reorder
+                # Total is unknown here; pass a large cap so parsing isn't
+                # rejected on range — the tool re-validates against the real
+                # deck. If it can't find a source+target, it's not a reorder.
+                if _parse_reorder(text, 9999) is not None:
+                    return {"action": "delegate", "preamble": "Reordering slides!",
+                            "tool": "ppt_reorder_slide", "args": {"instruction": text}, "mode": "queue"}
             _is_add_slide = (
                 "notes" not in _tl
                 and re.search(r'\b(?:add|insert|create)\b', _tl) is not None
@@ -460,7 +519,13 @@ class FrontLLMProvider:
                         {"role": "user",   "content": user_msg},
                     ]
 
-                raw = await asyncio.to_thread(_ollama_chat_sync, messages)
+                # High priority: routing sits on every voice turn's hot path and
+                # must jump ahead of any heavy background Ollama work (PPT
+                # generation, general_qa, ReAct) so it isn't starved into a
+                # timeout while a deck is generating.
+                from core.llm_gate import ollama_gate
+                raw = await ollama_gate.run(
+                    lambda: _ollama_chat_sync(messages), priority="high", label="classify")
 
                 result = json.loads(_extract_json(raw))
 
@@ -653,7 +718,12 @@ class FrontLLMProvider:
             return {"action": "ignore", "preamble": None, "tool": None, "args": {}, "mode": "queue"}
 
         if len(t.split()) >= 3:
-            return {"action": "delegate", "preamble": "Let me think about that!",
+            # No canned preamble here: this branch is the *fallback* taken when
+            # classify was unavailable (e.g. Ollama momentarily busy). Speaking
+            # "Let me think about that!" on every fallback turn makes a degraded
+            # LLM announce itself repeatedly. Route silently; the real answer
+            # still comes from general_qa.
+            return {"action": "delegate", "preamble": None,
                     "tool": "general_qa", "args": {"query": text}, "mode": "queue"}
 
         return {"action": "ignore", "preamble": None, "tool": None, "args": {}, "mode": "queue"}

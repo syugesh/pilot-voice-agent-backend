@@ -116,7 +116,10 @@ async def _try_ollama(content: str, system_prompt: str = SUMMARY_PROMPT, max_tok
                 return response["message"]["content"].strip()
             return response.message.content.strip()
 
-        return await asyncio.to_thread(_call)
+        # Low priority — shared by summaries, the resolution engine, the care
+        # observer and the ReAct agent. All background work; yields to routing.
+        from core.llm_gate import ollama_gate
+        return await ollama_gate.run(_call, priority="low", label="llm_chain")
     except Exception as e:
         logger.warning(f"Ollama summary failed: {e}")
         return None

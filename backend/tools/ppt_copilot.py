@@ -7,21 +7,56 @@ logger = logging.getLogger("pilot.tools.ppt")
 # when "what" was never actually said (so we ask instead of hallucinating
 # generic filler content that only coincidentally resembles a real slide) ──
 
+_ORDINALS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+}
+
 def _parse_insert_position(text: str) -> tuple[int | None, bool]:
     """Returns (insert_after, was_specified). insert_after is 0-indexed —
-    the new slide lands right after prs.slides[insert_after]. None means
-    "append at the end", which is also the default when nothing was said."""
+    the new slide lands right after prs.slides[insert_after]. -1 means "at the
+    very beginning" (before slide 1), None means "append at the end" (also the
+    default when nothing was said)."""
     t = text.lower()
+
+    # "after slide N" → land right after slide N (0-indexed N-1).
     m = re.search(r'\bafter\s+slide\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
     if m:
         return int(m.group(1)) - 1, True
+
+    # "before slide N" → before slide N == after slide N-1 (0-indexed N-2).
     m = re.search(r'\bbefore\s+slide\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
     if m:
-        return int(m.group(1)) - 2, True  # before slide N == after slide N-1
+        return int(m.group(1)) - 2, True
+
+    # "on/at slide N", "at position N", "as slide N", "make it slide N",
+    # "in position N", or a bare "slide N" — all mean "the new slide should
+    # BECOME slide N", i.e. occupy position N. That's after slide N-1 (0-indexed
+    # N-2), so slide N-1 stays before it and the old slide N shifts down.
+    m = re.search(
+        r'\b(?:on|at|as|in(?:to)?|position|make\s+it)\s+(?:the\s+)?'
+        r'(?:slide|position)?\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
+    if m:
+        n = int(m.group(1))
+        return (-1 if n <= 1 else n - 2), True
+
+    # Ordinal word forms: "as the third slide", "make it the second slide".
+    m = re.search(r'\b(?:as|make\s+it|at|position)\s+(?:the\s+)?(' + "|".join(_ORDINALS) + r')\s+slide\b', t)
+    if m:
+        n = _ORDINALS[m.group(1)]
+        return (-1 if n <= 1 else n - 2), True
+
     if re.search(r'\b(?:at the (?:beginning|start)|as the first slide|to the front)\b', t):
         return -1, True
-    if re.search(r'\b(?:at the end|as the last slide)\b', t):
+    if re.search(r'\b(?:at the end|as the last slide|to the end)\b', t):
         return None, True
+
+    # A bare "slide N" mentioned with add/insert/create phrasing → position N.
+    m = re.search(r'\bslide\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
+    if m and re.search(r'\b(?:add|insert|create|make|new)\b', t):
+        n = int(m.group(1))
+        return (-1 if n <= 1 else n - 2), True
+
     return None, False
 
 
@@ -626,10 +661,17 @@ async def ppt_add_slide(args: dict, session_id: str) -> dict:
     instruction = args.get("instruction", "").strip()
 
     insert_after, position_specified = _parse_insert_position(instruction)
-    if pending is not None and not position_specified:
-        # Position was already settled in the question that led to this
-        # follow-up turn (or deliberately left as "append at the end").
-        insert_after = pending.get("insert_after")
+    # Whether the user ever named a position — this turn, or in the pending
+    # clarification round. If they did, we honour it exactly; if they never
+    # did, PILOT picks the best spot itself (from the slide titles) so the
+    # deck keeps a coherent flow, and tells the user where it landed.
+    if pending is not None:
+        if position_specified:
+            pass  # user gave a position on the clarification turn — use it
+        elif pending.get("position_specified"):
+            insert_after = pending.get("insert_after")
+            position_specified = True
+    user_chose_position = position_specified
 
     if not _has_real_topic(instruction):
         if pending is not None:
@@ -637,11 +679,15 @@ async def ppt_add_slide(args: dict, session_id: str) -> dict:
             # — don't loop forever asking the same question.
             state.pending_add_slide = None
             return {"spoken_reply": "I still didn't catch what the slide should be about, so I'll leave it for now — just ask again whenever you're ready."}
-        state.pending_add_slide = {"insert_after": insert_after}
-        where = "" if insert_after is None else (
-            "at the very beginning" if insert_after == -1 else f"right after slide {insert_after + 1}"
+        # Remember whether a position was already stated so we don't re-ask or
+        # override it after we get the topic on the next turn.
+        state.pending_add_slide = {"insert_after": insert_after, "position_specified": position_specified}
+        where = "" if not position_specified else (
+            "at the very beginning" if insert_after == -1
+            else "at the end" if insert_after is None
+            else f"right after slide {insert_after + 1}"
         )
-        return {"spoken_reply": f"Sure — what should the new slide be about?" + (f" I'll put it {where}." if where else "")}
+        return {"spoken_reply": "Sure — what should the new slide be about?" + (f" I'll put it {where}." if where else "")}
 
     state.pending_add_slide = None
 
@@ -652,9 +698,48 @@ async def ppt_add_slide(args: dict, session_id: str) -> dict:
         slide_data = None
 
     if not slide_data:
-        slide_data = {"kind": "text", "title": instruction[:60], "paragraphs": []}
+        # Generation failed/timed out — still produce a real GD-template slide,
+        # not a blank one: "text" is a valid template kind whose source slides
+        # carry the Grid Dynamics branding.
+        logger.warning("ppt_add_slide: generation returned nothing — using GD 'text' fallback")
+        slide_data = {"kind": "text", "title": instruction[:60], "paragraphs": [instruction]}
 
-    kind = slide_data.pop("kind")
+    kind = slide_data.pop("kind", None)
+
+    # GUARANTEE the GD template is used: every added slide must be one of the
+    # known template kinds (each maps to real GD template source slides in
+    # _KIND_SOURCES). If the model returned an unknown/blank kind, coerce to
+    # "text" rather than letting add_slide_to_deck raise and — worse — ever
+    # emit an off-brand slide.
+    from services.ppt_template_builder import _KIND_SOURCES
+    if kind not in _KIND_SOURCES:
+        logger.warning(f"ppt_add_slide: invalid kind {kind!r} — coercing to GD 'text'")
+        title = slide_data.get("title") or instruction[:60]
+        slide_data = {"title": title, "paragraphs": slide_data.get("paragraphs") or [instruction]}
+        kind = "text"
+    new_title = slide_data.get("title") or instruction[:60]
+
+    # ── Auto-position: the user didn't say where, so read the existing slide
+    # titles and let PILOT choose the spot that best preserves the narrative
+    # flow, then announce it. Falls back to appending at the end. ──
+    placement_note = ""
+    if not user_chose_position:
+        from services.ppt_template_builder import pick_insert_position
+        titles = [(s.get("title") or "") for s in slides]
+        topic = new_title if kind not in ("agenda",) else (instruction or new_title)
+        picked = await pick_insert_position(titles, topic)
+        if picked is not None:
+            insert_after, reason = picked
+            if insert_after == -1:
+                placement_note = " I placed it at the start"
+            elif insert_after is None:
+                placement_note = " I placed it at the end"
+            else:
+                placement_note = f" I placed it after slide {insert_after + 1}"
+            placement_note += f" — {reason}." if reason else "."
+        else:
+            insert_after = None  # append at end
+            placement_note = " I added it at the end."
 
     try:
         ok = await _apply_add_and_background_refresh(effective_sid, kind, slide_data, session_id, insert_after)
@@ -666,7 +751,7 @@ async def ppt_add_slide(args: dict, session_id: str) -> dict:
             "instruction": instruction or "add a new slide",
             "changes": [f"new {kind} slide"],
         }
-        return {"spoken_reply": f"I've added a new slide — {slide_data.get('title', 'untitled')}."}
+        return {"spoken_reply": f"I've added a new slide — {new_title}.{placement_note}"}
     except Exception as e:
         logger.error(f"ppt_add_slide error: {e}")
         return {"spoken_reply": "I had trouble adding that slide."}
@@ -692,3 +777,98 @@ async def _apply_add_and_background_refresh(effective_sid: str, kind: str, data:
 
     asyncio.create_task(_background_refresh())
     return True
+
+
+def _parse_reorder(text: str, total: int) -> tuple[int, int] | None:
+    """Parse 'move slide X after/before slide Y', 'move slide X to position Y',
+    'move slide X to the front/end', ordinal forms. Returns (from_index,
+    to_index) both 0-based, or None if it can't find a clear source+target."""
+    t = text.lower()
+
+    def _num(word_or_digit: str) -> int | None:
+        if word_or_digit.isdigit():
+            return int(word_or_digit)
+        return _ORDINALS.get(word_or_digit)
+
+    # Source slide: "move slide 2" / "move the second slide" / "move slides 1 and 2"
+    src = None
+    m = re.search(r'\bslide[s]?\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
+    if m:
+        src = int(m.group(1))
+    else:
+        m = re.search(r'\b(' + "|".join(_ORDINALS) + r')\s+slide\b', t)
+        if m:
+            src = _ORDINALS[m.group(1)]
+    if src is None or not (1 <= src <= total):
+        return None
+    from_index = src - 1
+
+    # Target: after/before slide Y, to position Y, to front/end.
+    # _move_slide removes the source, THEN inserts. So compute the target
+    # against the POST-removal list: the anchor slide Y sits at index (y-1),
+    # shifted down by one if the source was before it.
+    def _anchor_index(y: int) -> int:
+        idx = y - 1
+        return idx - 1 if idx > from_index else idx
+
+    m = re.search(r'\bafter\s+slide\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
+    if m:
+        to = _anchor_index(int(m.group(1))) + 1  # land right AFTER the anchor
+        return from_index, max(0, min(to, total - 1))
+    m = re.search(r'\bbefore\s+slide\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
+    if m:
+        to = _anchor_index(int(m.group(1)))       # land AT the anchor's slot (pushes it down)
+        return from_index, max(0, min(to, total - 1))
+    m = re.search(r'\b(?:to|at|into?|position)\s+(?:the\s+)?(?:slide|position)?\s*(?:number|no\.?|#)?\s*(\d+)\b', t)
+    if m:
+        return from_index, max(0, min(int(m.group(1)) - 1, total - 1))
+    if re.search(r'\b(?:to the (?:front|beginning|start)|as the first)\b', t):
+        return from_index, 0
+    if re.search(r'\b(?:to the end|as the last)\b', t):
+        return from_index, total - 1
+    return None
+
+
+async def ppt_reorder_slide(args: dict, session_id: str) -> dict:
+    """Reorder a slide within the loaded deck ('move slide 1 after slide 3',
+    'move slide 2 to position 4'). This is the real reorder capability — before
+    it existed, such requests fell through to a generic answer that invented
+    manual PowerPoint drag-and-drop steps."""
+    from api.ppt import _slide_store, _latest_upload_sid, reorder_slide_fast_async, refresh_slide_thumbnails_async
+    from queues.bus import bus
+
+    effective_sid = session_id if session_id in _slide_store else _latest_upload_sid
+    slides = _slide_store.get(effective_sid, [])
+    total = len(slides)
+    if total < 2:
+        return {"spoken_reply": "There aren't enough slides to reorder yet."}
+
+    instruction = args.get("instruction", "")
+    parsed = _parse_reorder(instruction, total)
+    if parsed is None:
+        return {"spoken_reply": "Tell me which slide to move and where — for example, “move slide 1 after slide 3.”"}
+    from_index, to_index = parsed
+    if from_index == to_index:
+        return {"spoken_reply": f"Slide {from_index + 1} is already in that position."}
+
+    try:
+        final_index = await reorder_slide_fast_async(effective_sid, from_index, to_index)
+        if final_index is None:
+            return {"spoken_reply": "No presentation is loaded to reorder."}
+
+        async def _bg():
+            await refresh_slide_thumbnails_async(effective_sid)
+            await bus.emit_event("ppt_command", {"action": "goto", "index": final_index}, session_id)
+            await bus.emit_event("ppt_command", {"action": "refresh", "session_id": effective_sid}, session_id)
+        asyncio.create_task(_bg())
+
+        get_state(session_id).last_ppt_action = {
+            "tool": "ppt_reorder_slide", "slide_number": final_index + 1,
+            "instruction": instruction, "changes": [f"moved slide {from_index + 1} → position {final_index + 1}"],
+        }
+        return {"spoken_reply": f"Moved slide {from_index + 1} to position {final_index + 1}."}
+    except ValueError as e:
+        return {"spoken_reply": str(e)}
+    except Exception as e:
+        logger.error(f"ppt_reorder_slide error: {e}")
+        return {"spoken_reply": "I had trouble reordering that slide."}

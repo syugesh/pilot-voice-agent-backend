@@ -22,6 +22,7 @@ from api.enrollment import router as enrollment_router
 from api.transcripts import router as transcript_router
 from api.ppt import router as ppt_router
 from api.travel import router as travel_router
+from api.care import router as care_router
 from api.ws_audio import router as ws_audio_router
 from api.ws_events import router as ws_events_router
 
@@ -56,6 +57,7 @@ app.include_router(enrollment_router, prefix="/api/v1/enrollment",  tags=["enrol
 app.include_router(transcript_router, prefix="/api/v1/transcripts", tags=["transcripts"])
 app.include_router(ppt_router,        prefix="/api/v1/ppt",         tags=["ppt"])
 app.include_router(travel_router,     prefix="/api/v1/travel",      tags=["travel"])
+app.include_router(care_router,       prefix="/api/v1/care",        tags=["care"])
 
 # ── WebSocket routers ──
 app.include_router(ws_audio_router)

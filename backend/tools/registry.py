@@ -2,7 +2,7 @@
 Tool registry — maps tool_name → async handler(args, session_id) → dict.
 DS-A / FSE-A shared ownership.
 """
-from tools.ppt_copilot import ppt_navigate, ppt_jump_to_title, ppt_summarize, ppt_delete_slide, ppt_edit_slide, ppt_generate_notes, ppt_last_action, ppt_add_slide
+from tools.ppt_copilot import ppt_navigate, ppt_jump_to_title, ppt_summarize, ppt_delete_slide, ppt_edit_slide, ppt_generate_notes, ppt_last_action, ppt_add_slide, ppt_reorder_slide
 from tools.travel_planner import travel_search, flight_book
 from tools.tickets import ticket_create, ticket_update, ticket_close
 from tools.knowledge import kb_search
@@ -20,6 +20,7 @@ TOOL_REGISTRY: dict = {
     "ppt_generate_notes": ppt_generate_notes,
     "ppt_last_action":   ppt_last_action,
     "ppt_add_slide":     ppt_add_slide,
+    "ppt_reorder_slide": ppt_reorder_slide,
     "ticket_create":     ticket_create,
     "ticket_update":     ticket_update,
     "ticket_close":      ticket_close,

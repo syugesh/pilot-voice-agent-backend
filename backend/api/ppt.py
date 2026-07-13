@@ -1150,6 +1150,29 @@ async def add_slide_async(session_id: str, kind: str, data: dict,
     return await refresh_slide_thumbnails_async(session_id)
 
 
+async def reorder_slide_fast_async(session_id: str, from_index: int, to_index: int) -> Optional[int]:
+    """Move a slide within the deck and keep the kinds/sources sidecars in the
+    same order. Fast (XML only); pair with refresh_slide_thumbnails_async for
+    the visual update. Returns the slide's final index, or None if there's no
+    presentation on disk. Raises ValueError on an un-reorderable deck."""
+    pptx_path = f"data/ppt/{session_id}.pptx"
+    if not os.path.exists(pptx_path):
+        return None
+    from services.ppt_template_builder import reorder_slide_in_deck
+
+    final_index = await asyncio.to_thread(reorder_slide_in_deck, pptx_path, from_index, to_index)
+
+    # Mirror the move in the sidecars so kind/source stay attached to the slide.
+    def _reorder_list(lst: list):
+        if 0 <= from_index < len(lst):
+            item = lst.pop(from_index)
+            lst.insert(min(final_index, len(lst)), item)
+        return lst
+    _save_kinds(session_id, _reorder_list(_load_kinds(session_id) or []))
+    _save_sources(session_id, _reorder_list(_load_sources(session_id) or []))
+    return final_index
+
+
 class AddSlideReq(BaseModel):
     session_id:   str
     kind:         str

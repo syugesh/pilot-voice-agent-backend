@@ -24,6 +24,29 @@ def _is_stop_phrase(text: str) -> bool:
     return text.strip().lower().rstrip(".,!?") in _STOP_PHRASES
 
 
+import re as _re
+# Word-boundary matches, not exact-string — real speech carries filler words
+# ("alright, yes, confirm that") and ASR punctuation is inconsistent, so an
+# exact-match set (the first version of this) missed almost every natural
+# phrasing. Deny words are checked first: "no, don't confirm" must not read
+# as an affirmative just because "confirm" appears in it.
+_CONFIRM_WORD_RE = _re.compile(r'\b(confirm(ed)?|yes|go ahead|do it|proceed|submit)\b', _re.I)
+_DENY_WORD_RE = _re.compile(r'\b(no|cancel|don\'?t|stop|wait)\b', _re.I)
+
+def _confirm_intent(text: str) -> Optional[bool]:
+    """True = affirmative, False = explicit deny, None = not a confirmation
+    reply at all (so an unrelated utterance can't accidentally resolve a
+    pending confirmation just because some word loosely overlaps)."""
+    t = text.strip()
+    if not t:
+        return None
+    if _DENY_WORD_RE.search(t):
+        return False
+    if _CONFIRM_WORD_RE.search(t):
+        return True
+    return None
+
+
 @dataclass
 class RouteDecision:
     action:     str
@@ -75,6 +98,36 @@ class FrontLLMWorker:
             return
 
         state = get_state(span.session_id)
+
+        # ── Pending destructive-tool confirmation gate ────────────────────
+        # Checked BEFORE LLM classification, on the raw utterance, so this
+        # can never be confused for an unrelated tool call and so a
+        # same-turn spoof attempt from a different speaker is rejected
+        # deterministically rather than by asking an LLM to judge intent.
+        pc = state.pending_confirm
+        if pc and not pc.get("resolved"):
+            intent = _confirm_intent(span.text)
+            if intent is not None:
+                same_speaker = bool(span.speaker_id) and span.speaker_id == pc.get("speaker_id")
+                role_ok = (span.role or "").lower() in ("csr", "manager", "admin")
+                if intent is True and same_speaker and role_ok:
+                    pc["resolved"] = True
+                    logger.info(f"[{span.session_id[:6]}] confirm accepted tool={pc['tool']} "
+                                f"speaker={span.speaker_id}")
+                else:
+                    # Wrong speaker, wrong role, or an explicit "no" — do NOT
+                    # resolve as confirmed. Wake the waiter now (rather than
+                    # letting it time out) so the UI reflects the block
+                    # immediately, but PolicyGate._confirm() will see
+                    # resolved=False and treat this as identity_mismatch.
+                    logger.warning(
+                        f"[{span.session_id[:6]}] confirm rejected tool={pc['tool']} "
+                        f"attempted_by={span.speaker_id} role={span.role} "
+                        f"reason={'explicit_deny' if intent is False else 'identity_mismatch'}"
+                    )
+                pc["event"].set()
+                return
+
         ctx = state.get_context(6)
         usecase = getattr(state, "usecase", None) or \
                   getattr(session_manager.get(span.session_id), "usecase", "general") or "general"
@@ -122,9 +175,66 @@ class FrontLLMWorker:
             register_tts(tts_task)
 
         if decision.action == "delegate" and decision.tool:
-            # → DELEGATING
+            # → DELEGATING (single-tool fast path — unchanged)
             await session_manager.transition(span.session_id, SessionState.DELEGATING)
             asyncio.create_task(_delegate(decision))
+
+        if decision.action == "agent":
+            # → autonomous ReAct worker. Front LLM hands it a GOAL; the worker
+            # reasons/acts/observes and returns a result the gateway phrases.
+            await session_manager.transition(span.session_id, SessionState.DELEGATING)
+            asyncio.create_task(_run_agent(decision, usecase))
+
+
+# ── Output gateway ───────────────────────────────────────────────────────────
+# Every worker/agent result funnels back through here — the Front LLM is the
+# single output surface. The SINK depends on usecase: spoken (TTS) in
+# ppt/general, silent-to-dashboard in customercare (where PILOT observes a live
+# call and must never talk). The worker never emits to the user directly.
+
+async def gateway_emit(text: str, session_id: str, usecase: str):
+    from queues.bus import bus
+    from core.session_manager import session_manager, SessionState
+    from core.transcript_log import persist_pilot_reply
+
+    text = (text or "").strip()
+    if not text:
+        await session_manager.transition(session_id, SessionState.LISTENING)
+        return
+
+    if usecase == "customercare":
+        # Silent sink: surface the agent's conclusion on the dashboard only.
+        await bus.emit_event("agent_note", {"text": text}, session_id)
+        await session_manager.transition(session_id, SessionState.LISTENING)
+        return
+
+    # Spoken sink (ppt / general): show in transcript + TTS.
+    await session_manager.transition(session_id, SessionState.SPEAKING)
+    await bus.emit_event("transcript", {
+        "text": text, "speaker": "PILOT", "role": "assistant",
+        "confidence": 1.0, "timestamp": time.time(),
+    }, session_id)
+    asyncio.create_task(persist_pilot_reply(session_id, text))
+    from core.cancel_tokens import register_tts
+    register_tts(asyncio.create_task(_speak(text, session_id)))
+
+
+async def _run_agent(decision: "RouteDecision", usecase: str):
+    from services.react_agent import run as run_react
+    from tools.policy import ROLE_PERMS
+
+    role = (decision.role or "user").lower()
+    perms = ROLE_PERMS.get(role, ROLE_PERMS["user"])
+    # The worker may only reach tools this speaker's role can run (the loop
+    # re-checks each call via policy_gate too — this just trims its menu).
+    allowed = sorted(perms) if "*" not in perms else sorted(
+        {t for p in ROLE_PERMS.values() for t in p if t != "*"})
+
+    goal = (decision.args or {}).get("goal") or ""
+    result = await run_react(goal, session_id=decision.session_id,
+                             speaker_id=decision.speaker_id, role=decision.role,
+                             allowed_tools=allowed)
+    await gateway_emit(result.get("final", ""), decision.session_id, usecase)
 
 
 async def _speak(text: str, session_id: str):
@@ -167,6 +277,22 @@ _TOOL_DENIAL = {
     "ticket_close":     "close tickets",
     "flight_book":      "book flights",
 }
+
+
+def _min_required_level(tool: str) -> int | None:
+    """Lowest access level among roles actually permitted to run `tool`, read
+    straight from ROLE_PERMS so the denial message can't drift from policy.
+    Returns None if no non-admin role grants it (admin-only via '*')."""
+    from tools.policy import ROLE_PERMS
+    levels = [
+        _ROLE_LEVELS.get(r, 1)
+        for r, perms in ROLE_PERMS.items()
+        if tool in perms  # explicit grant only; '*' (admin) handled below
+    ]
+    if levels:
+        return min(levels)
+    # Only admin's wildcard covers it.
+    return _ROLE_LEVELS.get("admin", 4)
 
 
 # ── Tool arg whitelist — type + max-length per field ─────────────────────────
@@ -246,11 +372,20 @@ async def _delegate(decision: RouteDecision):
         role  = (decision.role or "user").lower()
         level = _ROLE_LEVELS.get(role, 1)
         action_label = _TOOL_DENIAL.get(decision.tool, "use that feature")
+        # Report the ACTUAL minimum level this tool needs, not a hardcoded
+        # "admin" — many tools only need CSR/manager, so "requires admin
+        # access" was both wrong and confusing (e.g. an admin turn misheard as
+        # a lower role would be told it needs a level it in fact outranks).
+        required = _min_required_level(decision.tool)
+        req_txt = f"Level {required} access" if required else "a higher access level"
         denial = (
             f"Sorry, you have Level {level} access and cannot {action_label}. "
-            f"This action requires admin access."
+            f"This action requires {req_txt}."
         )
-        # Show denial in transcript and speak it
+        # Surface in the transcript/UI, but do NOT speak it — an access denial
+        # is operator feedback, not something to read aloud on a call (and in
+        # customercare this path is unreachable anyway; the guard remains for
+        # the conversational modes).
         from queues.bus import bus
         await bus.emit_event("transcript", {
             "text": denial, "speaker": "PILOT", "role": "assistant",
@@ -258,7 +393,6 @@ async def _delegate(decision: RouteDecision):
         }, decision.session_id)
         from core.transcript_log import persist_pilot_reply
         asyncio.create_task(persist_pilot_reply(decision.session_id, denial))
-        asyncio.create_task(_speak(denial, decision.session_id))
         return
 
     from core.bg_supervisor import bg_supervisor, Job

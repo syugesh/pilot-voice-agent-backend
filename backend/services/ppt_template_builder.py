@@ -168,6 +168,23 @@ def _move_slide(prs, old_index: int, new_index: int):
     sld_id_lst.insert(new_index, el)
 
 
+def reorder_slide_in_deck(pptx_path: str, from_index: int, to_index: int) -> int:
+    """Move the slide at `from_index` (0-based) to `to_index` (0-based), both
+    clamped into range. Returns the slide's final 0-based index. Raises
+    ValueError on an empty/one-slide deck (nothing to reorder)."""
+    prs = Presentation(pptx_path)
+    n = len(prs.slides)
+    if n < 2:
+        raise ValueError("Need at least two slides to reorder.")
+    from_index = max(0, min(from_index, n - 1))
+    to_index = max(0, min(to_index, n - 1))
+    if from_index != to_index:
+        _move_slide(prs, from_index, to_index)
+        prs.save(pptx_path)
+    logger.info(f"Reordered slide {from_index} → {to_index} in {pptx_path}")
+    return to_index
+
+
 def add_slide_to_deck(pptx_path: str, kind: str, data: dict,
                        source_index_in_deck: int | None = None,
                        existing_source: str | None = None,
@@ -1202,7 +1219,12 @@ def _generate_template_content_sync(description: str, slide_count: int) -> dict 
 
 
 async def generate_template_content(description: str, slide_count: int) -> dict | None:
-    return await asyncio.to_thread(_generate_template_content_sync, description, slide_count)
+    # Low priority — a full-deck generation is many serial LLM calls; it must
+    # yield the Ollama slot to Front-LLM routing so voice turns stay responsive.
+    from core.llm_gate import ollama_gate
+    return await ollama_gate.run(
+        lambda: _generate_template_content_sync(description, slide_count),
+        priority="low", label="ppt_deck_gen")
 
 
 _SINGLE_SLIDE_PROMPT = """\
@@ -1266,4 +1288,65 @@ def _generate_single_slide_sync(instruction: str) -> dict | None:
 
 
 async def generate_single_slide_content(instruction: str) -> dict | None:
-    return await asyncio.to_thread(_generate_single_slide_sync, instruction)
+    from core.llm_gate import ollama_gate
+    return await ollama_gate.run(
+        lambda: _generate_single_slide_sync(instruction), priority="low", label="ppt_slide_gen")
+
+
+_POSITION_PROMPT = """\
+You are helping place ONE new slide into an existing presentation so the deck
+reads with a natural flow. Below are the current slide titles in order (1-based),
+followed by the topic of the new slide.
+
+Current slides:
+{slide_list}
+
+New slide topic: {topic}
+
+Decide where the new slide fits best so it follows logically from the slide
+before it and leads into the slide after it. Respond with ONLY a JSON object:
+{{"after": <N>, "reason": "<short reason>"}}
+where <N> is the 1-based number of the slide the new one should go RIGHT AFTER.
+Use 0 to place it at the very beginning (before slide 1). Keep the reason to one
+short clause naming the neighbouring topics. Return only the JSON, nothing else."""
+
+
+def _pick_insert_position_sync(titles: list[str], topic: str) -> tuple[int | None, str] | None:
+    """Ask the LLM for the best insertion point given the existing slide
+    titles and the new slide's topic. Returns (insert_after_0indexed, reason)
+    where insert_after is -1 for 'very beginning', or None on failure (caller
+    falls back to appending at the end)."""
+    if not titles:
+        return None
+    try:
+        import ollama
+        from core.config import settings
+        slide_list = "\n".join(f"{i+1}. {t or 'Untitled'}" for i, t in enumerate(titles))
+        prompt = _POSITION_PROMPT.format(slide_list=slide_list, topic=topic)
+        response = ollama.chat(
+            model=settings.OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            think=False, format="json",
+            options={"num_predict": 120, "num_ctx": 4096, "temperature": 0.2},
+            stream=False,
+        )
+        raw = response.message.content if hasattr(response, "message") else response["message"]["content"]
+        data = json.loads(raw)
+        after_1 = int(data.get("after"))
+        reason = str(data.get("reason", "")).strip()
+        # Clamp into range. 0 → very beginning (-1 in the 0-indexed convention);
+        # N → after slide N (index N-1). Anything past the end → append (None).
+        if after_1 <= 0:
+            return -1, reason
+        if after_1 >= len(titles):
+            return None, reason
+        return after_1 - 1, reason
+    except Exception as e:
+        logger.warning(f"auto-position pick failed ({e}) — will append at end")
+        return None
+
+
+async def pick_insert_position(titles: list[str], topic: str) -> tuple[int | None, str] | None:
+    from core.llm_gate import ollama_gate
+    return await ollama_gate.run(
+        lambda: _pick_insert_position_sync(titles, topic), priority="low", label="ppt_position")

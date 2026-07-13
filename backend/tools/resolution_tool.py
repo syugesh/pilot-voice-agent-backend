@@ -5,9 +5,14 @@ Pulls the live call's transcript + rolling sentiment history off the session,
 retrieves the best-matching KB procedures for the current issue, runs the
 resolution/escalation engine, generates the issue summary, and emits a single
 `resolution_update` WS event the dashboard renders (confidence, recommendation,
-reasons, KB citations, summary). Invoked like any other tool (voice "should I
-escalate this?" or a dashboard button), so it flows through the normal
-bg-supervisor + tool_end path too.
+reasons, KB citations, summary).
+
+Deliberately silent (spoken_reply is always ""), never auto-generated: the
+rep and customer share one call-audio line (headset/softphone), so an
+escalation/confidence assessment must never be spoken aloud — the customer
+would hear themselves being scored. The rep triggers this via a dashboard
+button (or asks PILOT by voice, but the *answer* only ever appears on
+screen) and acts on the recommendation in their own words.
 """
 import logging
 logger = logging.getLogger("pilot.tools.resolution")
@@ -36,7 +41,10 @@ async def resolution_assess(args: dict, session_id: str) -> dict:
     spans = state.get_context(20)
     transcript_text = _customer_transcript(spans) or (args.get("query") or "")
     if not transcript_text.strip():
-        return {"spoken_reply": "There's no customer conversation to assess yet."}
+        # Silent: rep + customer share one TTS line (headset/softphone), so
+        # even this "nothing to assess yet" message must not be spoken —
+        # the rep can see it's empty on the dashboard instead.
+        return {"status": "ok", "spoken_reply": ""}
 
     kb_hits = await kb_index.search(transcript_text, k=3)
     result = await assess(transcript_text, state.sentiment_history, kb_hits)
@@ -45,13 +53,11 @@ async def resolution_assess(args: dict, session_id: str) -> dict:
     payload = {**result, "issue_summary": issue_summary, "kb_articles": kb_hits}
     await bus.emit_event("resolution_update", payload, session_id)
 
-    # A concise spoken line for the rep; the rich detail is on the dashboard.
-    if result["recommendation"] == "escalate":
-        spoken = f"I'd recommend escalating this to {result['escalation_target']}. {result['reasoning']}"
-    else:
-        spoken = f"This looks resolvable on the call — confidence {int(result['resolution_confidence']*100)} percent. {result['reasoning']}"
-
-    return {"status": "ok", "spoken_reply": spoken, **payload}
+    # Never spoken: rep and customer are on the same call audio, so reading
+    # an escalation/confidence assessment aloud would mean the customer hears
+    # themselves being scored — this tool is dashboard-only by design. The
+    # rep reads resolution_update on screen and acts on it in their own words.
+    return {"status": "ok", "spoken_reply": "", **payload}
 
 
 async def escalate_ticket(args: dict, session_id: str) -> dict:

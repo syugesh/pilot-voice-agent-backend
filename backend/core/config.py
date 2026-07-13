@@ -27,7 +27,13 @@ class Settings(BaseSettings):
 
     # Model settings
     WHISPER_MODEL: str = "distil-large-v3"
-    OLLAMA_MODEL: str = "qwen3:8b"
+    OLLAMA_MODEL: str = "qwen3:8b"            # heavy work: general_qa, PPT gen, ReAct, summaries
+    # The Front LLM only routes ("which tool + args for this utterance") — a
+    # small structured-output task. Running it on a tiny model keeps routing
+    # fast and cheap even while the big model is busy with a background job, so
+    # classify no longer times out during a PPT generation. Falls back to
+    # OLLAMA_MODEL if this isn't pulled.
+    CLASSIFY_MODEL: str = "qwen3.5:4b"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     # Hard ceiling on a single classify() call to Ollama. Without this, a slow
     # or memory-starved Ollama instance blocks the whole voice pipeline for as

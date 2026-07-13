@@ -110,11 +110,33 @@ def _majority_vote(
     """
     # Accumulate confidence per (speaker_id, role) pair
     scores: dict[tuple, float] = {}
+    counts: dict[tuple, int] = {}
     for speaker_id, role, conf in results:
         key = (speaker_id, role)
         scores[key] = scores.get(key, 0.0) + conf
+        counts[key] = counts.get(key, 0) + 1
 
-    best_key = max(scores, key=scores.get)
+    unmatched_key = (None, None)
+    matched_keys = [k for k in scores if k != unmatched_key]
+
+    if matched_keys:
+        # A single loud/clean "no match" window (e.g. a quiet breath or
+        # cross-talk edge frame) used to be able to out-weight several
+        # correctly-matched-but-quieter windows purely on summed confidence,
+        # voting the WHOLE turn unmatched even when most windows genuinely
+        # heard an enrolled speaker. Prefer the best real match by WINDOW
+        # COUNT (how many windows actually agreed), falling back to summed
+        # confidence only to break a count tie among real candidates —
+        # "no match" only wins if it has a strict majority of windows, since
+        # that's the only case actually indicating the enrolled voice
+        # wasn't the one speaking.
+        best_key = max(matched_keys, key=lambda k: (counts[k], scores[k]))
+        unmatched_share = counts.get(unmatched_key, 0) / len(results)
+        if unmatched_share > 0.5:
+            best_key = unmatched_key
+    else:
+        best_key = unmatched_key
+
     best_speaker_id, best_role = best_key
     total_conf = sum(scores.values())
     win_conf   = scores[best_key]
@@ -126,6 +148,7 @@ def _majority_vote(
     logger.info(
         f"[{session_id[:8]}] streaming vote → {best_speaker_id!r} "
         f"cosine={cosine_pct}% "
-        f"({len(results)} windows, win_share={win_conf/max(total_conf,1e-6):.0%})"
+        f"({len(results)} windows, win_count={counts[best_key]}, "
+        f"win_share={win_conf/max(total_conf,1e-6):.0%})"
     )
     return label, best_speaker_id, best_role, min(avg_conf, 1.0)
