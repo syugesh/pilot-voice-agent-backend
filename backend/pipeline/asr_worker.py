@@ -250,8 +250,22 @@ class ASRWorker:
             # the Front LLM path does). So the span is NOT put on transcript_q
             # (which drives classify → speak/delegate). Instead it feeds the
             # background field-extractor that updates the dashboard only.
-            from services.care_observer import observe
-            observe(turn.session_id, usecase)
+            #
+            # Exception: an explicit "go to <page>" command is addressed to
+            # PILOT, not part of the call. Without this carve-out it fell
+            # into the silent observer like any other sentence — folded into
+            # the CSR issue synopsis and, every few turns, into the
+            # escalation-assessment agent's prompt, which is why navigating
+            # away from this page could look like PILOT "deciding to
+            # escalate" instead of just switching pages. Route it through
+            # the normal classify()/_delegate() path instead, same as
+            # every other usecase.
+            from services.front_llm import _detect_navigate_page
+            if _detect_navigate_page(text):
+                await self.bus.transcript_q.put(span)
+            else:
+                from services.care_observer import observe
+                observe(turn.session_id, usecase)
         else:
             # Conversational modes (ppt, general): PILOT talks back — route the
             # turn to the Front LLM for classification + TTS as before.

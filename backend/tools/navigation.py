@@ -9,16 +9,22 @@ import asyncio, logging
 
 logger = logging.getLogger("pilot.tools.navigation")
 
-VALID_PAGES = {"dashboard", "ppt", "care", "guidelines", "about", "profile", "settings"}
+# Must exactly match the pages the frontend router actually handles (see
+# Dashboard() in TranscriptOverlay.tsx). "guidelines" and "settings" used to
+# be real destinations but "guidelines" was merged into "about" and
+# "settings" was never built as a page — offering them here let a voice
+# command "succeed" at navigating to a page id the router doesn't recognize,
+# which silently fell through to the dashboard instead of the requested
+# page. That mismatch was the actual cause of navigation looking
+# inconsistent (some phrases "worked", others quietly did nothing).
+VALID_PAGES = {"dashboard", "ppt", "care", "about", "profile"}
 
 PAGE_LABELS = {
-    "dashboard":  "the Main Dashboard",
-    "ppt":        "PPT Copilot",
-    "care":       "Customer Care",
-    "guidelines": "Guidelines",
-    "about":      "the About page",
-    "profile":    "your Profile",
-    "settings":   "Settings",
+    "dashboard": "the Main Dashboard",
+    "ppt":       "PPT Copilot",
+    "care":      "Customer Care",
+    "about":     "the About page",
+    "profile":   "your Profile",
 }
 
 

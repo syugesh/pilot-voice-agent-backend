@@ -1,5 +1,5 @@
 """PPT API — navigate + file upload + AI generation with slide extraction."""
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
@@ -9,6 +9,20 @@ from io import BytesIO
 logger = logging.getLogger("pilot.ppt")
 
 router = APIRouter()
+
+
+def _user_id_from_token(authorization: str | None) -> str | None:
+    """Same pattern as api/sessions.py's _claims_from_token — extracts the
+    JWT 'sub' claim (the user id) so PPT history can be scoped per user
+    instead of a single shared list every account could see and click into."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    try:
+        from core.security import decode_token
+        claims = decode_token(authorization.split(" ", 1)[1])
+        return str(claims["sub"])
+    except Exception:
+        return None
 
 class PPTCmd(BaseModel):
     session_id: str
@@ -94,20 +108,66 @@ def _load_sources(session_id: str) -> list | None:
     return None
 
 
-def _save_index_entry(session_id: str, title: str, description: str, slide_count: int):
+def _save_index_entry(session_id: str, title: str, description: str, slide_count: int,
+                       user_id: str | None = None):
     os.makedirs("data/ppt", exist_ok=True)
     entries = _load_index()
-    # Remove any prior entry for this session (re-generation)
+    # Remove any prior entry for this exact session_id (re-generation of the
+    # SAME deck replaces its own entry — this is not the MRU reordering; each
+    # genuinely distinct upload/generation now gets its own session_id, see
+    # newAnonPptSid() on the frontend, so this only ever collides with itself).
     entries = [e for e in entries if e.get("session_id") != session_id]
+    now = __import__("datetime").datetime.now().isoformat(timespec="seconds")
     entries.insert(0, {
-        "session_id":  session_id,
-        "title":       title,
-        "description": description,
-        "slide_count": slide_count,
-        "created_at":  __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+        "session_id":   session_id,
+        "title":        title,
+        "description":  description,
+        "slide_count":  slide_count,
+        "user_id":      user_id,
+        "created_at":   now,
+        "last_used_at": now,
     })
     with open(_INDEX_PATH, "w") as f:
         json.dump(entries[:50], f, indent=2)   # keep last 50
+
+
+def _touch_index_entry(session_id: str):
+    """Bump this entry's last_used_at to now — called whenever a deck is
+    reopened from history, so the list behaves as true most-recently-USED
+    (not just most-recently-created): opening an old presentation brings it
+    back to the top, same as a browser's history or an LRU cache."""
+    entries = _load_index()
+    for e in entries:
+        if e.get("session_id") == session_id:
+            e["last_used_at"] = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+            break
+    with open(_INDEX_PATH, "w") as f:
+        json.dump(entries, f, indent=2)
+
+
+async def _autofill_speaker_notes(session_id: str):
+    """Fire-and-forget background task: generate speaker notes for every
+    slide that doesn't already have them, right after a deck is uploaded or
+    created — no user action required. Runs AFTER the endpoint has already
+    returned the deck to the frontend (which shows it immediately and polls
+    /slides/{sid} for notes to appear — see PPTView.tsx), since notes
+    generation is a real per-slide LLM call and blocking the initial
+    upload/create response on it would mean 10s-90s+ of dead wait depending
+    on deck size and provider latency.
+    """
+    try:
+        from services.ppt_template_builder import generate_notes_for_deck
+        slides = _slide_store.get(session_id, [])
+        if not slides:
+            return
+        notes_by_index = await generate_notes_for_deck(slides)
+        if not notes_by_index:
+            logger.info(f"[{session_id[:8]}] auto-notes: nothing to generate")
+            return
+        await apply_notes_batch_async(session_id, notes_by_index)
+        logger.info(f"[{session_id[:8]}] auto-notes: filled {len(notes_by_index)}/{len(slides)} slides")
+    except Exception as e:
+        logger.error(f"[{session_id[:8]}] auto-notes background task failed: {e}", exc_info=True)
 
 
 @router.post("/navigate")
@@ -242,10 +302,28 @@ def _convert_to_images_sync(pptx_path: str, out_dir: str, keep_existing_on_failu
 
 
 @router.post("/upload")
-async def upload_ppt(session_id: str, file: UploadFile = File(...)):
+async def upload_ppt(session_id: str, file: UploadFile = File(...),
+                      authorization: str | None = Header(None)):
     """Accept .pptx, convert slides to images (LibreOffice) + extract text metadata."""
+    user_id = _user_id_from_token(authorization)
+    if not user_id:
+        raise HTTPException(401, "Session expired — please log in again")
     if not file.filename.endswith((".pptx", ".ppt")):
         raise HTTPException(400, "Only .pptx files supported")
+
+    title = os.path.splitext(file.filename)[0]
+    # Re-uploading a file with the same name is treated as re-using that same
+    # deck (updating it), not creating a second history row for it — redirect
+    # onto the EXISTING entry's session_id so this upload overwrites that slot
+    # in place rather than the frontend's freshly-minted id creating a
+    # duplicate. Scoped to this user only.
+    existing = next(
+        (e for e in _load_index() if e.get("user_id") == user_id and e.get("title") == title),
+        None,
+    )
+    if existing:
+        session_id = existing["session_id"]
+
     content = await file.read()
     os.makedirs("data/ppt", exist_ok=True)
     path = f"data/ppt/{session_id}.pptx"
@@ -275,6 +353,12 @@ async def upload_ppt(session_id: str, file: UploadFile = File(...)):
     _slide_store[session_id] = slides
     _latest_upload_sid = session_id
     _current_slide[session_id] = 0
+
+    _ppt_titles[session_id] = title
+    _save_index_entry(session_id, title, "Uploaded presentation", len(slides), user_id=user_id)
+
+    asyncio.create_task(_autofill_speaker_notes(session_id))
+
     return {"status": "ok", "slide_count": len(slides), "slides": slides}
 
 
@@ -302,7 +386,7 @@ class GenerateRequest(BaseModel):
 
 
 @router.post("/generate")
-async def generate_ppt(req: GenerateRequest):
+async def generate_ppt(req: GenerateRequest, authorization: str | None = Header(None)):
     """
     AI-generate a .pptx from a text description.
     Uses Ollama (local, free) to write kind-tagged slide content, then clones
@@ -310,6 +394,13 @@ async def generate_ppt(req: GenerateRequest):
     content — see services/ppt_template_builder.py.
     Returns the same slide format as /upload so the viewer loads immediately.
     """
+    user_id = _user_id_from_token(authorization)
+    if not user_id:
+        # Missing OR expired token (access tokens last 15 min — see
+        # core/config.py). Failing loudly here beats silently generating
+        # the deck with user_id=None: an orphaned entry nobody's history
+        # filter will ever show again (see api/ppt.py history endpoints).
+        raise HTTPException(401, "Session expired — please log in again")
     if not req.description.strip():
         raise HTTPException(400, "Description cannot be empty")
     slide_count = max(3, min(req.slide_count, 20))
@@ -346,8 +437,11 @@ async def generate_ppt(req: GenerateRequest):
 
     title = content.get("presentation_title", "Generated Presentation")
     _ppt_titles[req.session_id] = title
-    _save_index_entry(req.session_id, title, req.description, len(slides))
+    _save_index_entry(req.session_id, title, req.description, len(slides), user_id=user_id)
     logger.info(f"Generated '{title}' — {len(slides)} slides for session {req.session_id[:8]}")
+
+    asyncio.create_task(_autofill_speaker_notes(req.session_id))
+
     return {"status": "ok", "slide_count": len(slides), "slides": slides, "title": title}
 
 
@@ -1528,16 +1622,31 @@ def _patch_slide(
 
 
 @router.get("/history")
-async def get_history():
-    """Return list of all previously generated presentations, newest first."""
-    return {"history": _load_index()}
+async def get_history(authorization: str | None = Header(None)):
+    """Return this user's previously generated/uploaded presentations,
+    most-recently-USED first (opening an old one from history bumps it back
+    to the top — see _touch_index_entry). Scoped to the logged-in user —
+    entries saved before user_id was tracked (user_id is None) belong to
+    nobody and are excluded."""
+    user_id = _user_id_from_token(authorization)
+    if not user_id:
+        raise HTTPException(401, "Login required")
+    mine = [e for e in _load_index() if e.get("user_id") == user_id]
+    mine.sort(key=lambda e: e.get("last_used_at") or e.get("created_at") or "", reverse=True)
+    return {"history": mine}
 
 
 @router.get("/history/load/{session_id}")
-async def load_history(session_id: str):
+async def load_history(session_id: str, authorization: str | None = Header(None)):
     """Reload a previously generated PPT into the viewer."""
     if re.search(r'[/\\.]\.', session_id):
         raise HTTPException(400, "Invalid session id")
+    user_id = _user_id_from_token(authorization)
+    if not user_id:
+        raise HTTPException(401, "Login required")
+    entry = next((e for e in _load_index() if e.get("session_id") == session_id), None)
+    if not entry or entry.get("user_id") != user_id:
+        raise HTTPException(404, "Presentation not found")
     pptx_path = f"data/ppt/{session_id}.pptx"
     if not os.path.exists(pptx_path):
         raise HTTPException(404, "Presentation file not found on disk")
@@ -1558,14 +1667,14 @@ async def load_history(session_id: str):
                 slide["image_url"] = f"/api/v1/ppt/image/{session_id}/{fname}?v={version}"
 
     # Restore in-memory state so navigate/jump work
-    entry = next((e for e in _load_index() if e["session_id"] == session_id), {})
-    title = entry.get("title", slides[0]["title"] if slides else "Presentation")
+    title = entry.get("title") or (slides[0]["title"] if slides else "Presentation")
     _slide_store[session_id]  = slides
     _ppt_titles[session_id]   = title
     _current_slide[session_id] = 0
 
     global _latest_upload_sid
     _latest_upload_sid = session_id
+    _touch_index_entry(session_id)
 
     return {"status": "ok", "slide_count": len(slides), "slides": slides, "title": title}
 

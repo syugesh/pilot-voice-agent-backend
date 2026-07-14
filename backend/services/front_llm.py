@@ -105,7 +105,7 @@ changes an EXISTING slide's content. instruction = what the new slide
 should be about (the whole request works fine as-is).
 CARE TOOLS: ticket_create, ticket_update, ticket_close, kb_search(query), crm_lookup, travel_search, flight_book, resolution_assess, escalate_ticket
 Use resolution_assess when the rep asks whether to escalate, what to do, how the call is going, or for a resolution/escalation recommendation ("should I escalate this?", "what's the recommendation?", "how likely can I resolve this?"). Use escalate_ticket to create an escalation ticket for the current issue.
-NAVIGATION: navigate_page(page: "dashboard"|"ppt"|"care"|"guidelines"|"about"|"profile"|"settings") — use when the user asks to go to, open, switch to, or be taken/redirected to one of the app's top-level pages (e.g. "take me to PPT Copilot", "open customer care", "go to the dashboard"). Never use for in-page requests like "go to slide 5".
+NAVIGATION: navigate_page(page: "dashboard"|"ppt"|"care"|"about"|"profile") — use when the user asks to go to, open, switch to, or be taken/redirected to one of the app's top-level pages (e.g. "take me to PPT Copilot", "open customer care", "go to the dashboard"). Never use for in-page requests like "go to slide 5".
 GENERAL: general_qa(query) — world knowledge, facts, concepts, definitions, science, "who is", "what is", "tell me", "explain", "how does", "why", "what does", "describe", "difference between"
 
 slide_number is 0-indexed: "go to slide 7" → slide_number=6
@@ -139,21 +139,29 @@ _NAV_VERB_RE = re.compile(
     r'\b(?:go to|open|switch to|take me to|navigate to|show me|redirect me to|'
     r'redirect to|pull up|bring up)\b'
 )
+# Page ids here MUST match tools/navigation.py's VALID_PAGES exactly, which
+# in turn must match what Dashboard() in TranscriptOverlay.tsx actually
+# routes — "guidelines" and "settings" used to be listed here but neither
+# is a real page the frontend router recognizes (guidelines merged into
+# about; settings was never built), so voice nav to either silently fell
+# through to the dashboard. "guidelines" phrasing now maps to "about" since
+# that's where the guidelines content actually lives today.
 _PAGE_TARGETS: list[tuple[str, tuple[str, ...]]] = [
-    ("ppt",        ("ppt copilot", "powerpoint", "presentation page", "presentation copilot", " ppt ", " ppt")),
-    ("care",       ("customer care", "care page", "support page", "help desk", "travel planner")),
-    ("guidelines", ("guidelines", "operator manual", "help guide", "command reference")),
-    ("about",      ("about page", "about pilot", "about section")),
+    ("ppt",        ("ppt copilot", "powerpoint", "presentation page", "presentation copilot",
+                     "slide page", "slides page", " ppt ", " ppt")),
+    ("care",       ("customer care", "care page", "support page", "help desk", "travel planner",
+                     "customer resolution", "resolution page", "ticket page", "tickets page",
+                     "customer service", "customer support")),
+    ("about",      ("about page", "about pilot", "about section", "guidelines",
+                     "operator manual", "help guide", "command reference")),
     ("profile",    ("my profile", "profile page", "account page", " profile")),
-    ("settings",   ("settings page", "preferences", " settings")),
     # Checked last — "dashboard"/"home" are common words, so only match once
     # nothing more specific above has already matched.
     ("dashboard",  ("main dashboard", "dashboard", "home page", "home screen")),
 ]
 _PAGE_LABELS = {
     "dashboard": "the Main Dashboard", "ppt": "PPT Copilot", "care": "Customer Care",
-    "guidelines": "Guidelines", "about": "the About page", "profile": "your Profile",
-    "settings": "Settings",
+    "about": "the About page", "profile": "your Profile",
 }
 
 def _detect_navigate_page(text: str) -> str | None:
@@ -164,6 +172,44 @@ def _detect_navigate_page(text: str) -> str | None:
         if any(p in t for p in phrases):
             return page_id
     return None
+
+
+# ── Per-page tool scoping ─────────────────────────────────────────────────
+# navigate_page is always allowed so the user can leave any page by voice.
+# general_qa is the only "content" tool allowed on the dashboard — it has no
+# page-specific workflow of its own, just world-knowledge Q&A.
+_NAV_TOOL = "navigate_page"
+USECASE_TOOLS: dict[str, set[str]] = {
+    "general":      {"general_qa", _NAV_TOOL},
+    "ppt": {
+        "ppt_navigate", "ppt_jump_to_title", "ppt_summarize", "ppt_delete_slide",
+        "ppt_edit_slide", "ppt_generate_notes", "ppt_last_action", "ppt_add_slide",
+        "ppt_reorder_slide", "general_qa", _NAV_TOOL,
+    },
+    "customercare": {
+        "ticket_create", "ticket_update", "ticket_close", "kb_search", "crm_lookup",
+        "travel_search", "flight_book", "resolution_assess", "escalate_ticket", _NAV_TOOL,
+    },
+}
+
+
+def _scope_to_usecase(result: dict, usecase: str) -> dict:
+    """
+    Final choke point for every classify() return path (fast-path,
+    LLM-classified, and keyword fallback alike) — reject any tool pick that
+    isn't in this page's allowlist rather than letting an off-page tool run.
+    Without this, the LLM classify path had no restriction at all: its system
+    prompt lists every tool regardless of usecase, so e.g. the dashboard
+    could still trigger ppt_delete_slide if the model picked it.
+    """
+    tool = result.get("tool")
+    if not tool:
+        return result
+    allowed = USECASE_TOOLS.get(usecase, USECASE_TOOLS["general"])
+    if tool in allowed:
+        return result
+    logger.info(f"Tool {tool!r} not allowed on usecase={usecase!r} — dropping to ignore")
+    return {"action": "ignore", "preamble": None, "tool": None, "args": {}, "mode": "queue"}
 
 
 def _fix_respond_now_questions(result: dict, text: str, usecase: str) -> dict:
@@ -390,6 +436,18 @@ class FrontLLMProvider:
     async def classify(self, text: str, speaker_id: str, role: str,
                        context: list, usecase: str = "general",
                        session_id: str = "") -> dict:
+        # Single choke point: every internal return path (fast-path,
+        # LLM-classified, keyword fallback) funnels through here so a tool
+        # pick outside this page's allowlist can never reach _delegate().
+        result = await self._classify_unscoped(
+            text=text, speaker_id=speaker_id, role=role,
+            context=context, usecase=usecase, session_id=session_id,
+        )
+        return _scope_to_usecase(result, usecase)
+
+    async def _classify_unscoped(self, text: str, speaker_id: str, role: str,
+                       context: list, usecase: str = "general",
+                       session_id: str = "") -> dict:
         # Mid-clarification: ppt_add_slide asked "what should the new slide
         # be about?" and is waiting for the answer on this very next turn.
         # Route the whole utterance straight back to it rather than letting
@@ -500,9 +558,12 @@ class FrontLLMProvider:
                     f"{c.get('speaker','?')}: {c.get('text','')}"
                     for c in context[-5:]
                 )
+                allowed_tools = sorted(USECASE_TOOLS.get(usecase, USECASE_TOOLS["general"]))
                 user_msg = (
                     f"Today's date: {datetime.date.today().isoformat()}\n"
                     f"Usecase: {usecase}\n"
+                    f"Tools allowed on this page ONLY — never pick a tool outside this list, "
+                    f"use general_qa or ignore instead: {', '.join(allowed_tools)}\n"
                     f"Recent context:\n{ctx_str}\n\n"
                     f"Speaker: {speaker_id} ({role})\n"
                     f'Text: "{text}"\n'

@@ -303,6 +303,18 @@ def _set_paragraphs(text_frame_owner, texts: list[str]):
         txBody.remove(p)
 
     for i, text in enumerate(texts or [""]):
+        # The LLM is asked for plain strings but occasionally returns a list
+        # (e.g. "body": ["point one", "point two"]) or a non-string scalar.
+        # lxml requires str for element .text — passing anything else raises
+        # TypeError, which the caller's try/except turns into "skip this
+        # whole slide," leaving the template's original placeholder text
+        # (e.g. "Title" / "Lorem Ipsum...") visible instead of real content.
+        # Coercing here means a malformed field degrades to readable text
+        # instead of silently failing slide population.
+        if isinstance(text, list):
+            text = "\n".join(str(t) for t in text)
+        elif not isinstance(text, str):
+            text = "" if text is None else str(text)
         template = templates[i] if i < len(templates) else templates[-1]
         new_p = copy.deepcopy(template)
         runs = new_p.findall(qn("a:r"))
@@ -362,21 +374,28 @@ GD, MIN = TEMPLATE_PATH, TEMPLATE_PATH_MINIMALIST
 # silently leave the other one showing raw dummy template copy. A kind with
 # only one entry here had only one genuinely safe candidate; the rest were
 # excluded for that reason, not overlooked.
+# Re-verified 2026-07-14 against the current templates after they were
+# rebuilt/simplified (originally edited as .odp, converted back to .pptx —
+# see services/ppt_template_builder.py module docstring). The old indices
+# pointed past the end of the file (deck shrank from 39→25 slides) or at
+# slides whose marker shapes no longer exist. Every entry below was
+# confirmed by actually running that kind's _LOCATORS[...] function against
+# the slide and checking every field it needs resolves to a real shape —
+# not just "looks similar". team / speaker_1 / speaker_4 / key_message /
+# table have NO surviving candidate slide in either template (those layouts
+# were removed in the redesign) and are intentionally absent — see
+# _TEMPLATE_PROMPT / _SINGLE_SLIDE_PROMPT, which no longer offer them as
+# valid "kind" values.
 _KIND_SOURCES: dict[str, list[tuple[str, int]]] = {
     "cover":        [(GD,0),(GD,1),(GD,2),(GD,3),(GD,4),(GD,5),(MIN,0),(MIN,1)],
-    "agenda":       [(GD,6),(MIN,4)],
-    "text":         [(GD,7),(GD,8),(GD,30)],
-    "two_column":   [(GD,9),(GD,10)],
-    "comparison":   [(GD,9),(GD,10)],
-    "team":         [(GD,11),(GD,12),(GD,13),(MIN,3)],
-    "speaker_1":    [(GD,12),(GD,13)],
-    "speaker_4":    [(GD,13)],
-    "text_blocks":  [(GD,14)],
-    "key_message":  [(GD,19)],
-    "table":        [(GD,23),(GD,33),(GD,34),(GD,35)],
-    "subsection":   [(GD,24),(GD,25),(GD,27),(GD,28),(MIN,9)],
-    "chapter":      [(GD,29)],
-    "thank_you":    [(GD,38),(MIN,11)],
+    "agenda":       [(GD,6)],
+    "text":         [(GD,7),(GD,8),(GD,21)],
+    "two_column":   [(GD,9)],
+    "comparison":   [(GD,10)],
+    "text_blocks":  [(GD,11)],
+    "subsection":   [(GD,17),(GD,18),(GD,19)],
+    "chapter":      [(GD,20)],
+    "thank_you":    [(GD,23)],
 }
 
 # Legacy fixed index per kind — the source every already-generated deck was
@@ -1086,13 +1105,10 @@ content — you do not need to use every kind, and you may repeat a kind):
 - "agenda": {{"items": ["...", "..."]}} — 3-7 short agenda line items
 - "text": {{"title": "...", "paragraphs": ["...", "..."]}} — 1-2 paragraphs of prose
 - "two_column": {{"title": "...", "left": {{"heading":"...","body":"..."}}, "right": {{"heading":"...","body":"..."}}}}
+  "heading" and "body" MUST be plain strings, never arrays — if you have
+  multiple points, join them into ONE string separated by newlines.
 - "comparison": same shape as "two_column" — use when contrasting two options
-- "team": {{"title": "...", "people": [{{"name":"...","title":"..."}}, ...]}} — up to 6 people
-- "speaker_1": {{"title": "...", "name": "...", "role": "...", "bio": "..."}}
-- "speaker_4": {{"title": "...", "speakers": [{{"name":"...","role":"...","bio":"..."}}, ...]}} — exactly 4
 - "text_blocks": {{"title": "...", "blocks": [{{"heading":"...","items":["...", "..."]}}, ...]}} — up to 4 blocks
-- "key_message": {{"title": "...", "messages": ["...", "..."]}} — 1-2 short standalone statements
-- "table": {{"title": "...", "headers": ["...", ...], "rows": [["...", ...], ...]}} — at most 5 columns
 - "subsection": {{"title": "..."}} — a section-divider slide with just a title
 - "chapter": {{"title": "...", "description": "..."}} — a section-divider slide with title + one-line description
 
@@ -1104,13 +1120,92 @@ Rules:
   elsewhere on every slide as the company name.
 - Generate roughly {n} content slides total (not counting cover/thank_you).
 - Prefer variety: don't use "text" for everything — pick the kind that best
-  fits each piece of content (a table for numeric data, "comparison" for
-  two contrasting options, "team"/"speaker_1"/"speaker_4" only if the topic
-  actually involves people, etc).
+  fits each piece of content ("comparison" for two contrasting options,
+  "text_blocks" for several distinct sub-points, etc).
 - Every field is plain text — no markdown symbols (* # -) anywhere.
 - Output MUST be complete valid JSON.
+- CONTENT MUST BE SPECIFIC TO THE TOPIC. Every paragraph, bullet, heading,
+  and body must state real facts, mechanisms, examples, or claims that
+  are actually about "{topic}" — never generic filler, boilerplate business
+  language, or placeholder-style sentences that could apply to any topic
+  unchanged. If you do not know enough concrete detail about some aspect of
+  the topic, write a real, narrower true statement instead of a vague one —
+  do not pad with empty phrases ("plays a key role", "is an important
+  consideration", "offers many benefits") that carry no actual information
+  about "{topic}" specifically.
 
 Topic: {topic}"""
+
+
+# ── LLM cascade: Gemini → Groq → Ollama ───────────────────────────────────
+# PPT content generation used to be Ollama-only. Per project requirements
+# this needs to prefer the hosted providers (higher-quality, more reliable
+# JSON output) and only fall back to the local model when both cloud keys
+# are absent or the calls fail — same provider order already used by
+# tools/general_qa.py and services/session_summary.py, just applied here
+# too so behavior is consistent across every PPT content-generation path
+# (full-deck, single-slide-add, insert-position).
+#
+# Gemini/Groq are separate hosted services with no contention against the
+# local voice pipeline, so they're called directly. Ollama is the local
+# model that DOES contend with live voice-turn classification, so — same as
+# before this change — it's the only leg that goes through ollama_gate for
+# priority scheduling, and only runs at all once both cloud legs are
+# unavailable or fail.
+
+async def _try_gemini_text(prompt: str, model: str = "gemini-2.0-flash") -> str | None:
+    from core.config import settings
+    if not settings.GEMINI_API_KEY:
+        return None
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        gen_model = genai.GenerativeModel(model)
+        resp = await gen_model.generate_content_async(prompt)
+        return resp.text.strip()
+    except Exception as e:
+        logger.warning(f"Gemini call failed: {e}")
+        return None
+
+
+async def _try_groq_text(prompt: str, max_tokens: int = 4096) -> str | None:
+    from core.config import settings
+    if not settings.GROQ_API_KEY:
+        return None
+    try:
+        from groq import AsyncGroq
+        client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+        resp = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.warning(f"Groq call failed: {e}")
+        return None
+
+
+async def _chat_json_cascade(prompt: str, ollama_call, max_tokens: int = 4096) -> tuple[str | None, str]:
+    """Try Gemini, then Groq, then the given sync Ollama callable (run via
+    ollama_gate). Returns (raw_text_or_None, provider_used) — provider_used
+    is one of "gemini"/"groq"/"ollama"/"none", useful for logging which leg
+    actually produced the content."""
+    raw = await _try_gemini_text(prompt)
+    if raw:
+        return raw, "gemini"
+
+    raw = await _try_groq_text(prompt, max_tokens=max_tokens)
+    if raw:
+        return raw, "groq"
+
+    from core.llm_gate import ollama_gate
+    try:
+        raw = await ollama_gate.run(ollama_call, priority="low", label="ppt_deck_gen")
+    except Exception as e:
+        logger.error(f"Ollama fallback failed: {e}")
+        raw = None
+    return raw, ("ollama" if raw else "none")
 
 
 def _repair_json(raw: str) -> str:
@@ -1149,82 +1244,86 @@ def _repair_json(raw: str) -> str:
     return raw
 
 
+# team / speaker_1 / speaker_4 / key_message / table removed — no surviving
+# candidate slide for these kinds in the current templates (see the comment
+# above _KIND_SOURCES). Kept out of both this dict and the prompts below so
+# the LLM never proposes a kind that can't actually be rendered.
 _REQUIRED_FIELDS = {
     "agenda":      ["items"],
     "text":        ["title", "paragraphs"],
     "two_column":  ["title", "left", "right"],
     "comparison":  ["title", "left", "right"],
-    "team":        ["title", "people"],
-    "speaker_1":   ["title", "name", "bio"],
-    "speaker_4":   ["title", "speakers"],
     "text_blocks": ["title", "blocks"],
-    "key_message": ["title", "messages"],
-    "table":       ["title", "headers", "rows"],
     "subsection":  ["title"],
     "chapter":     ["title", "description"],
 }
 
 
-def _generate_template_content_sync(description: str, slide_count: int) -> dict | None:
+def _ollama_call_template_content(prompt: str):
+    """Sync Ollama call — passed to _chat_json_cascade as the last-resort leg."""
+    import ollama
+    from core.config import settings
+    response = ollama.chat(
+        model=settings.OLLAMA_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        think=False,
+        format="json",
+        options={"num_predict": -1, "num_ctx": 8192, "temperature": 0.6},
+        stream=False,
+    )
+    return response.message.content if hasattr(response, "message") else response["message"]["content"]
+
+
+def _parse_template_content(raw: str, description: str) -> dict | None:
     try:
-        import ollama
-        from core.config import settings
-        prompt = _TEMPLATE_PROMPT.format(n=slide_count, topic=description)
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning(f"template-content JSON invalid ({e}), attempting repair")
+        data = json.loads(_repair_json(raw))
 
-        response = ollama.chat(
-            model=settings.OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            think=False,
-            format="json",
-            options={"num_predict": -1, "num_ctx": 8192, "temperature": 0.6},
-            stream=False,
-        )
-        raw = response.message.content if hasattr(response, "message") else response["message"]["content"]
-
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            logger.warning(f"format=json still invalid ({e}), attempting repair")
-            data = json.loads(_repair_json(raw))
-
-        if "slides" not in data:
-            logger.error(f"Response missing 'slides': {raw[:200]}")
-            return None
-
-        before = len(data["slides"])
-        data["slides"] = [
-            s for s in data["slides"]
-            if s.get("kind") in _REQUIRED_FIELDS
-            and all(s.get(f) for f in _REQUIRED_FIELDS[s["kind"]])
-        ]
-        dropped = before - len(data["slides"])
-        if dropped:
-            logger.warning(f"{dropped} slide(s) had an unknown kind or missing required fields and were removed")
-
-        title = data.get("presentation_title") or "Generated Presentation"
-        today = datetime.date.today().strftime("%B %Y")
-        data["slides"] = (
-            [{"kind": "cover", "title": title, "date": today}]
-            + data["slides"]
-            + [{"kind": "thank_you"}]
-        )
-        data["presentation_title"] = title
-
-        logger.info(f"Generated {len(data['slides'])} slides for: {description[:50]}")
-        return data
-
-    except Exception as e:
-        logger.error(f"Ollama template-content generate failed: {e}")
+    if "slides" not in data:
+        logger.error(f"Response missing 'slides': {raw[:200]}")
         return None
+
+    before = len(data["slides"])
+    data["slides"] = [
+        s for s in data["slides"]
+        if s.get("kind") in _REQUIRED_FIELDS
+        and all(s.get(f) for f in _REQUIRED_FIELDS[s["kind"]])
+    ]
+    dropped = before - len(data["slides"])
+    if dropped:
+        logger.warning(f"{dropped} slide(s) had an unknown kind or missing required fields and were removed")
+
+    title = data.get("presentation_title") or "Generated Presentation"
+    today = datetime.date.today().strftime("%B %Y")
+    data["slides"] = (
+        [{"kind": "cover", "title": title, "date": today}]
+        + data["slides"]
+        + [{"kind": "thank_you"}]
+    )
+    data["presentation_title"] = title
+
+    logger.info(f"Generated {len(data['slides'])} slides for: {description[:50]}")
+    return data
 
 
 async def generate_template_content(description: str, slide_count: int) -> dict | None:
-    # Low priority — a full-deck generation is many serial LLM calls; it must
-    # yield the Ollama slot to Front-LLM routing so voice turns stay responsive.
-    from core.llm_gate import ollama_gate
-    return await ollama_gate.run(
-        lambda: _generate_template_content_sync(description, slide_count),
-        priority="low", label="ppt_deck_gen")
+    """Gemini → Groq → Ollama cascade — see _chat_json_cascade for why."""
+    prompt = _TEMPLATE_PROMPT.format(n=slide_count, topic=description)
+    raw, provider = await _chat_json_cascade(
+        prompt, lambda: _ollama_call_template_content(prompt), max_tokens=8192)
+    if not raw:
+        logger.error("template-content generation failed on every provider")
+        return None
+    try:
+        data = _parse_template_content(raw, description)
+    except Exception as e:
+        logger.error(f"template-content parse failed (provider={provider}): {e}")
+        return None
+    if data:
+        logger.info(f"template-content generated via {provider}")
+    return data
 
 
 _SINGLE_SLIDE_PROMPT = """\
@@ -1236,13 +1335,10 @@ slide — no markdown, no explanation, nothing else, and no "slides" wrapper:
 Valid "kind" values and their fields (pick the ONE that best fits):
 - "text": {{"title": "...", "paragraphs": ["...", "..."]}}
 - "two_column": {{"title": "...", "left": {{"heading":"...","body":"..."}}, "right": {{"heading":"...","body":"..."}}}}
+  "heading" and "body" MUST be plain strings, never arrays — if you have
+  multiple points, join them into ONE string separated by newlines.
 - "comparison": same shape as "two_column" — use when contrasting two options
-- "team": {{"title": "...", "people": [{{"name":"...","title":"..."}}, ...]}} — up to 6 people
-- "speaker_1": {{"title": "...", "name": "...", "role": "...", "bio": "..."}}
-- "speaker_4": {{"title": "...", "speakers": [{{"name":"...","role":"...","bio":"..."}}, ...]}} — exactly 4
 - "text_blocks": {{"title": "...", "blocks": [{{"heading":"...","items":["...", "..."]}}, ...]}} — up to 4 blocks
-- "key_message": {{"title": "...", "messages": ["...", "..."]}} — 1-2 short standalone statements
-- "table": {{"title": "...", "headers": ["...", ...], "rows": [["...", ...], ...]}} — at most 5 columns
 - "subsection": {{"title": "..."}} — a section-divider slide with just a title
 - "chapter": {{"title": "...", "description": "..."}} — a section-divider slide with title + one-line description
 - "agenda": {{"items": ["...", "..."]}} — 3-7 short agenda line items
@@ -1251,46 +1347,56 @@ Rules:
 - Do NOT put "Grid Dynamics" in any title or heading.
 - Every field is plain text — no markdown symbols (* # -) anywhere.
 - Output MUST be complete valid JSON, just the single slide object.
+- CONTENT MUST BE SPECIFIC to what the slide is about — real facts,
+  mechanisms, or examples, never generic filler that could apply to any
+  topic unchanged.
 
 What the new slide should be about: {instruction}"""
 
 
-def _generate_single_slide_sync(instruction: str) -> dict | None:
+def _ollama_call_single_slide(prompt: str):
+    import ollama
+    from core.config import settings
+    response = ollama.chat(
+        model=settings.OLLAMA_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        think=False,
+        format="json",
+        options={"num_predict": 500, "num_ctx": 4096, "temperature": 0.6},
+        stream=False,
+    )
+    return response.message.content if hasattr(response, "message") else response["message"]["content"]
+
+
+def _parse_single_slide(raw: str) -> dict | None:
     try:
-        import ollama
-        from core.config import settings
-        prompt = _SINGLE_SLIDE_PROMPT.format(instruction=instruction)
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = json.loads(_repair_json(raw))
 
-        response = ollama.chat(
-            model=settings.OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            think=False,
-            format="json",
-            options={"num_predict": 500, "num_ctx": 4096, "temperature": 0.6},
-            stream=False,
-        )
-        raw = response.message.content if hasattr(response, "message") else response["message"]["content"]
-
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            data = json.loads(_repair_json(raw))
-
-        kind = data.get("kind")
-        if kind not in _REQUIRED_FIELDS or not all(data.get(f) for f in _REQUIRED_FIELDS[kind]):
-            logger.warning(f"Single-slide generation produced an invalid slide: {raw[:200]}")
-            return None
-
-        return data
-    except Exception as e:
-        logger.error(f"Ollama single-slide generate failed: {e}")
+    kind = data.get("kind")
+    if kind not in _REQUIRED_FIELDS or not all(data.get(f) for f in _REQUIRED_FIELDS[kind]):
+        logger.warning(f"Single-slide generation produced an invalid slide: {raw[:200]}")
         return None
+    return data
 
 
 async def generate_single_slide_content(instruction: str) -> dict | None:
-    from core.llm_gate import ollama_gate
-    return await ollama_gate.run(
-        lambda: _generate_single_slide_sync(instruction), priority="low", label="ppt_slide_gen")
+    """Gemini → Groq → Ollama cascade — see _chat_json_cascade for why."""
+    prompt = _SINGLE_SLIDE_PROMPT.format(instruction=instruction)
+    raw, provider = await _chat_json_cascade(
+        prompt, lambda: _ollama_call_single_slide(prompt), max_tokens=800)
+    if not raw:
+        logger.error("single-slide generation failed on every provider")
+        return None
+    try:
+        data = _parse_single_slide(raw)
+    except Exception as e:
+        logger.error(f"single-slide parse failed (provider={provider}): {e}")
+        return None
+    if data:
+        logger.info(f"single-slide generated via {provider}")
+    return data
 
 
 _POSITION_PROMPT = """\
@@ -1311,42 +1417,147 @@ Use 0 to place it at the very beginning (before slide 1). Keep the reason to one
 short clause naming the neighbouring topics. Return only the JSON, nothing else."""
 
 
-def _pick_insert_position_sync(titles: list[str], topic: str) -> tuple[int | None, str] | None:
+def _ollama_call_position(prompt: str):
+    import ollama
+    from core.config import settings
+    response = ollama.chat(
+        model=settings.OLLAMA_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        think=False, format="json",
+        options={"num_predict": 120, "num_ctx": 4096, "temperature": 0.2},
+        stream=False,
+    )
+    return response.message.content if hasattr(response, "message") else response["message"]["content"]
+
+
+def _parse_position(raw: str, n_titles: int) -> tuple[int | None, str]:
+    data = json.loads(raw)
+    after_1 = int(data.get("after"))
+    reason = str(data.get("reason", "")).strip()
+    # Clamp into range. 0 → very beginning (-1 in the 0-indexed convention);
+    # N → after slide N (index N-1). Anything past the end → append (None).
+    if after_1 <= 0:
+        return -1, reason
+    if after_1 >= n_titles:
+        return None, reason
+    return after_1 - 1, reason
+
+
+async def pick_insert_position(titles: list[str], topic: str) -> tuple[int | None, str] | None:
     """Ask the LLM for the best insertion point given the existing slide
     titles and the new slide's topic. Returns (insert_after_0indexed, reason)
     where insert_after is -1 for 'very beginning', or None on failure (caller
-    falls back to appending at the end)."""
+    falls back to appending at the end). Gemini → Groq → Ollama cascade —
+    see _chat_json_cascade for why."""
     if not titles:
         return None
+    slide_list = "\n".join(f"{i+1}. {t or 'Untitled'}" for i, t in enumerate(titles))
+    prompt = _POSITION_PROMPT.format(slide_list=slide_list, topic=topic)
     try:
-        import ollama
-        from core.config import settings
-        slide_list = "\n".join(f"{i+1}. {t or 'Untitled'}" for i, t in enumerate(titles))
-        prompt = _POSITION_PROMPT.format(slide_list=slide_list, topic=topic)
-        response = ollama.chat(
-            model=settings.OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            think=False, format="json",
-            options={"num_predict": 120, "num_ctx": 4096, "temperature": 0.2},
-            stream=False,
-        )
-        raw = response.message.content if hasattr(response, "message") else response["message"]["content"]
-        data = json.loads(raw)
-        after_1 = int(data.get("after"))
-        reason = str(data.get("reason", "")).strip()
-        # Clamp into range. 0 → very beginning (-1 in the 0-indexed convention);
-        # N → after slide N (index N-1). Anything past the end → append (None).
-        if after_1 <= 0:
-            return -1, reason
-        if after_1 >= len(titles):
-            return None, reason
-        return after_1 - 1, reason
+        raw, provider = await _chat_json_cascade(
+            prompt, lambda: _ollama_call_position(prompt), max_tokens=200)
+        if not raw:
+            logger.warning("auto-position pick failed on every provider — will append at end")
+            return None
+        result = _parse_position(raw, len(titles))
+        logger.info(f"insert-position picked via {provider}")
+        return result
     except Exception as e:
         logger.warning(f"auto-position pick failed ({e}) — will append at end")
         return None
 
 
-async def pick_insert_position(titles: list[str], topic: str) -> tuple[int | None, str] | None:
-    from core.llm_gate import ollama_gate
-    return await ollama_gate.run(
-        lambda: _pick_insert_position_sync(titles, topic), priority="low", label="ppt_position")
+# ── Automatic speaker notes — generated for every slide right after a deck
+# is uploaded or created, no user action required (see api/ppt.py's
+# _autofill_speaker_notes, run as a background task after /upload and
+# /generate return). Presenter-facing only: PILOT never reads these aloud,
+# they're a silent visual aid so someone presenting the deck knows what to
+# say without the audience hearing it read back to them. ──────────────────
+
+_NOTES_PROMPT = """\
+Write 2-3 natural, conversational sentences of speaker notes for someone
+about to present this slide out loud. Base them ONLY on what this slide
+actually says — do not invent facts, statistics, or claims that aren't
+below. If the slide has very little text, keep the notes correspondingly
+short rather than padding with generic filler.
+
+Slide title: {title}
+Slide content: {content}
+
+Output the speaker notes as plain prose only — no markdown, no bullet
+points, no prefix like "Speaker notes:", nothing else."""
+
+
+def _slide_text_for_notes(slide: dict) -> str:
+    """Pull every substantive text shape off a slide (title excluded — it's
+    passed separately), skipping the page-number placeholder and shapes too
+    short to carry real content. This is deliberately NOT the numbered-list
+    bullet parser tools/ppt_copilot.py uses for voice-triggered notes edits —
+    the template's generated slides don't use numbered-list formatting at
+    all, so that parser would see empty content on every slide type except
+    a plain bulleted "text" kind."""
+    title = (slide.get("title") or "").strip()
+    parts = []
+    for sh in slide.get("shapes", []):
+        text = (sh.get("text") or "").strip()
+        if not text or text == title or text == "<number>" or len(text) < 8:
+            continue
+        parts.append(text)
+    return "\n".join(parts)
+
+
+async def _ollama_call_notes(prompt: str):
+    import ollama
+    from core.config import settings
+    response = ollama.chat(
+        model=settings.OLLAMA_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        think=False,
+        options={"num_predict": 220},
+        stream=False,
+    )
+    return response.message.content if hasattr(response, "message") else response["message"]["content"]
+
+
+async def generate_slide_notes(title: str, content: str) -> str | None:
+    """One slide's speaker notes via the Gemini → Groq → Ollama cascade."""
+    prompt = _NOTES_PROMPT.format(title=title or "Untitled", content=content or "(no text content)")
+    raw = await _try_gemini_text(prompt)
+    provider = "gemini"
+    if not raw:
+        raw = await _try_groq_text(prompt, max_tokens=220)
+        provider = "groq"
+    if not raw:
+        from core.llm_gate import ollama_gate
+        try:
+            raw = await ollama_gate.run(lambda: _ollama_call_notes(prompt), priority="low", label="ppt_auto_notes")
+            provider = "ollama"
+        except Exception as e:
+            logger.warning(f"auto-notes Ollama fallback failed: {e}")
+            raw = None
+    if not raw:
+        return None
+    logger.info(f"auto-notes generated via {provider}")
+    return raw.strip()
+
+
+async def generate_notes_for_deck(slides: list[dict]) -> dict[int, str]:
+    """Generate speaker notes for every slide in one deck concurrently
+    (not sequentially — a 7-slide deck sequentially would be ~7x one
+    provider round-trip; concurrent calls mostly overlap). Skips slides
+    that already have notes (e.g. re-running after a manual edit) and
+    slides with no real text content (cover/thank_you dividers) since
+    there's nothing to summarize. Returns {slide_index: notes_text} for
+    only the slides that succeeded — a failure on one slide doesn't lose
+    the others."""
+    async def _one(i: int, slide: dict) -> tuple[int, str | None]:
+        if (slide.get("notes") or "").strip():
+            return i, None
+        content = _slide_text_for_notes(slide)
+        if not content.strip():
+            return i, None
+        notes = await generate_slide_notes(slide.get("title") or "", content)
+        return i, notes
+
+    results = await asyncio.gather(*[_one(i, s) for i, s in enumerate(slides)])
+    return {i: notes for i, notes in results if notes}

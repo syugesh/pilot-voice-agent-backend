@@ -13,6 +13,9 @@ pydantic-settings>=2.5.2
 aiosqlite==0.20.0
 sqlalchemy[asyncio]==2.0.31
 
+# Speaker embeddings (voice enrollment / identification) — not on PyPI, install from GitHub
+git+https://github.com/wenet-e2e/wespeaker.git
+
 # ML / Speech  (Python 3.13 requires numpy>=2.0)
 numpy>=2.0.0
 silero-vad>=5.1

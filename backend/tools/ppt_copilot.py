@@ -376,7 +376,7 @@ Output ONLY valid JSON matching this schema:
             # reasoning-capable model (Qwen3, etc.) tries to emit chain-of-thought
             # before its JSON, which conflicts with grammar-constrained JSON
             # decoding and can come back as empty content (see _summarize_ollama
-            # above, and _generate_template_content_sync in
+            # above, and _ollama_call_template_content in
             # services/ppt_template_builder.py, for the same fix).
             options={"num_predict": 400},
             format="json",

@@ -1,51 +1,56 @@
 [
   {
-    "session_id": "anon-mr4p94wb-4omh1copor2",
-    "title": "Understanding Neural Networks",
-    "description": "create a presentation on neural networks",
+    "session_id": "anon-mrkeb6x9-juuh1bckz7n",
+    "title": "Low_Light_Enhancement",
+    "description": "Uploaded presentation",
+    "slide_count": 14,
+    "user_id": "1",
+    "created_at": "2026-07-14T14:04:59",
+    "last_used_at": "2026-07-14T14:04:59"
+  },
+  {
+    "session_id": "anon-mrkbb0ro-9d4kn09c4u",
+    "title": "Supervised Learning",
+    "description": "can you create a presentation on supervised learning",
     "slide_count": 7,
-    "created_at": "2026-07-09T15:22:51"
+    "user_id": "1",
+    "created_at": "2026-07-14T12:41:08",
+    "last_used_at": "2026-07-14T12:41:08"
   },
   {
-    "session_id": "e0f15b58-1585-477b-bb55-949d434ce8e8",
-    "title": "Getting Started with Machine Learning",
-    "description": "create a presentation on machine learning for beginners",
+    "session_id": "anon-mrk8772j-gc25kn9136k",
+    "title": "Kubernetes Overview",
+    "description": "create PPT for kubernetes",
     "slide_count": 7,
-    "created_at": "2026-07-09T14:52:14"
+    "user_id": "1",
+    "created_at": "2026-07-14T11:13:58",
+    "last_used_at": "2026-07-14T12:07:58"
   },
   {
-    "session_id": "fb21e455-ae49-458a-8556-5508cfd18715",
-    "title": "Agentic AI: Empowering Intelligent Automation",
-    "description": "can you create a presentation on agentic AI",
-    "slide_count": 5,
-    "created_at": "2026-07-07T11:30:21"
+    "session_id": "anon-mrjdtjxz-zys1tpf3son",
+    "title": "Black and Gray Minimalist Creative Portfolio Presentation",
+    "description": "Uploaded presentation",
+    "slide_count": 11,
+    "user_id": "1",
+    "created_at": "2026-07-13T21:03:46",
+    "last_used_at": "2026-07-14T11:20:23"
   },
   {
-    "session_id": "4f35317f-65e0-4f29-baa2-a6baee2fcc82",
-    "title": "Introduction to Machine Learning for Beginners",
-    "description": "create a presentation on machine learning for beginners",
-    "slide_count": 5,
-    "created_at": "2026-07-02T22:54:14"
+    "session_id": "anon-mrj8tdic-r80c1rn26t",
+    "title": "Project-1",
+    "description": "Uploaded presentation",
+    "slide_count": 17,
+    "user_id": "1",
+    "created_at": "2026-07-13T20:51:10",
+    "last_used_at": "2026-07-14T11:14:10"
   },
   {
-    "session_id": "anon-mqyr78rj-r5oye0gbudc",
-    "title": "Mastering Kubernetes: From Basics to Advanced Deployment",
-    "description": "create a PPT for kubernetes from basic to advanced",
-    "slide_count": 10,
-    "created_at": "2026-06-29T10:47:28"
-  },
-  {
-    "session_id": "anon-mqxol0i5-6jr5e7n387o",
-    "title": "Introduction to Agentic AI Systems on Enterprise Levels",
-    "description": "Introduction to Agentic AI Systems on Enterprise Levels",
-    "slide_count": 9,
-    "created_at": "2026-06-28T16:34:34"
-  },
-  {
-    "session_id": "anon-mqw5bzsm-yn7wi4joa5c",
-    "title": "Mastering Machine Learning: Concepts, Applications, and Future Trends",
-    "description": "create a PPT on machine learning",
-    "slide_count": 10,
-    "created_at": "2026-06-28T11:31:44"
+    "session_id": "anon-mrj81i43-ja48l4nz9q",
+    "title": "Machine Learning Basics",
+    "description": "a pilot can you create a PPT on machine learning for beginners",
+    "slide_count": 7,
+    "created_at": "2026-07-13T18:22:06",
+    "user_id": "1",
+    "last_used_at": "2026-07-13T21:00:46"
   }
 ]

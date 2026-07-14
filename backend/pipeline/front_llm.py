@@ -325,7 +325,9 @@ _ARG_SCHEMA: dict[str, dict[str, tuple]] = {
 }
 
 _ALLOWED_DIRECTION = {"next", "prev", "first", "last"}
-_ALLOWED_PAGES = {"dashboard", "ppt", "care", "guidelines", "about", "profile", "settings"}
+# Must match tools/navigation.py's VALID_PAGES — "guidelines"/"settings"
+# aren't real frontend routes (see that file's comment for why).
+_ALLOWED_PAGES = {"dashboard", "ppt", "care", "about", "profile"}
 
 def _sanitize_args(tool: str, args: dict) -> dict:
     """Validate and coerce LLM-generated tool args. Drops unknown keys, enforces types/lengths."""
