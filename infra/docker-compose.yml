@@ -1,0 +1,37 @@
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.backend
+    ports: ["8000:8000"]
+    volumes:
+      - pilot_data:/app/data
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./data/pilot.db
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - JWT_SECRET=4ac59be8bd405294175609905160d5f93813d259b52af351d5bf1e19224f788c
+      - ONLYOFFICE_JWT_SECRET=4ac59be8bd405294175609905160d5f93813d259b52af351d5bf1e19224f788c
+      - ONLYOFFICE_URL=http://onlyoffice:80
+      - ONLYOFFICE_PUBLIC_URL=http://localhost:8082
+      - APP_URL=http://host.docker.internal:8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.frontend
+    ports: ["3000:80"]
+    depends_on: [backend]
+
+  onlyoffice:
+    image: onlyoffice/documentserver:latest
+    container_name: onlyoffice-ds
+    ports:
+      - "8082:80"
+    environment:
+      - JWT_ENABLED=true
+      - JWT_SECRET=4ac59be8bd405294175609905160d5f93813d259b52af351d5bf1e19224f788c
+
+volumes:
+  pilot_data:

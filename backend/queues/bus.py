@@ -1,6 +1,11 @@
 """
 Queue Bus — all asyncio.Queue singletons.
 Pipeline: raw_audio_q → turn_q → diar_q → labeled_turn_q → transcript_q → event_q
+
+Diarization and identity resolution are one combined step (DiarizerWorker
+in pipeline/diarizer.py) — a turn goes straight from diar_q to
+labeled_turn_q already carrying its resolved speaker_id/role, no separate
+identity queue/stage in between.
 """
 
 import asyncio
@@ -65,7 +70,7 @@ class PipelineEvent:
     session_id: str
 
 
-# raw_audio_q → (VAD/SmartTurn) → turn_q → (?) → diar_q → (Diarizer) → labeled_turn_q → (?) → identity_q → (Identity) → ??? → transcript_q → (ASR or persistence) → event_q
+# raw_audio_q → (VAD/SmartTurn) → turn_q → (?) → diar_q → (Diarizer + Identity) → labeled_turn_q → (ASR) → transcript_q → (FrontLLM/persistence) → event_q
 class QueueBus:
     def __init__(self):
         self.raw_audio_q: asyncio.Queue[RawAudioChunk] = asyncio.Queue(maxsize=settings.RAW_AUDIO_Q_SIZE)
@@ -74,9 +79,6 @@ class QueueBus:
             maxsize=settings.TURN_Q_SIZE
         )  # NEW: SmartTurn → Diarizer
         self.labeled_turn_q: asyncio.Queue[LabeledTurn] = asyncio.Queue(maxsize=settings.LABELED_TURN_Q_SIZE)
-        self.identity_q: asyncio.Queue[LabeledTurn] = asyncio.Queue(
-            maxsize=settings.LABELED_TURN_Q_SIZE
-        )  # NEW: Diarizer → Identity
         self.transcript_q: asyncio.Queue[TranscriptSpan] = asyncio.Queue(maxsize=settings.TRANSCRIPT_Q_SIZE)
         self.event_q: asyncio.Queue[PipelineEvent] = asyncio.Queue(maxsize=settings.EVENT_Q_SIZE)
 

@@ -1,6 +1,9 @@
 """
-who spoke when or separating different voices in the audio stream).
-
+Diarization + identity resolution — combined into one step. Separating
+"who spoke" (diarization) from "which enrolled account is that" (identity)
+across two queue hops added latency and complexity with no benefit, since
+identity resolution always immediately follows diarization for every turn
+anyway — merged here so a turn goes straight from diar_q to labeled_turn_q.
 """
 
 import asyncio
@@ -14,6 +17,15 @@ logger = logging.getLogger("pilot.diarizer")
 class DiarizerWorker:
     def __init__(self, bus: QueueBus):
         self.bus = bus
+        # Per-session memory of which diarized voice cluster (spk-N) was
+        # heard FIRST — presumed to be that session's owner (the person
+        # actually running PILOT). The biometric matcher in
+        # services/enrollment.py is unreliable enough that even a
+        # genuinely-enrolled second speaker often fails to cross
+        # COSINE_THRESHOLD, and without this, EVERY unmatched voice used to
+        # collapse to the same "You" fallback — silently mislabeling a real
+        # second person as the session owner instead of as unidentified.
+        self._session_primary_label: dict[str, str] = {}
 
     def _load(self):
         from backend.services.diarizer import pyannote_provider
@@ -33,28 +45,45 @@ class DiarizerWorker:
             try:
                 from backend.services.diarizer import pyannote_provider
 
-                # This service uses Pyannote.audio (an unsupervised speaker segmentation and clustering model) to analyze the acoustic features of the audio.
+                # Pyannote.audio-shaped unsupervised speaker segmentation/
+                # clustering: groups the audio into speaker profiles and
+                # extracts a temporary label (e.g. spk-0 for Speaker 1).
                 segments = await pyannote_provider.segment(seg.pcm, session_id=seg.session_id)
-                # It groups the audio into speaker profiles and extracts a temporary label (e.g., spk-0 for Speaker 1, spk-1 for Speaker 2).
                 label = segments[0].speaker_label if segments else "spk-0"
-
             except Exception as e:
                 logger.error(f"Diarizer error: {e}")
                 label = "spk-0"
-                # Creates a LabeledTurn object containing the original audio, the determined speaker label, and placeholder values for speaker_id and role (which will be filled in by the subsequent identity pipeline stage).
 
-            # It attaches the temporary speaker label (e.g., speaker_label="spk-0"), while leaving speaker_id (the actual user name/email) and role empty (None), as this will be resolved by the next worker in the pipeline.
+            # Identity resolution — match this segment's voice against
+            # enrolled profiles (see services/enrollment.py) to attach a
+            # real speaker_id/role right here, rather than a separate
+            # pipeline stage.
+            speaker_id: str | None = None
+            role: str | None = None
+            confidence = 0.0
+            try:
+                from backend.services.enrollment import identify_speaker
+
+                speaker_id, role, confidence = await identify_speaker(seg.pcm)
+            except Exception as e:
+                logger.error(f"Identity error: {e}")
+                confidence = 0.8
+
+            if speaker_id:
+                role = role or "user"
+            else:
+                primary_label = self._session_primary_label.setdefault(seg.session_id, label)
+                speaker_id = "You" if label == primary_label else f"Unknown speaker ({label})"
+                role = role or "user"
+
             labeled = LabeledTurn(
                 pcm=seg.pcm,
                 session_id=seg.session_id,
                 timestamp=seg.timestamp,
                 speaker_label=label,
-                speaker_id=None,
-                role=None,
-                confidence=0.0,
+                speaker_id=speaker_id,
+                role=role,
+                confidence=confidence,
                 cached_text=seg.cached_text,
             )
-            await self.bus.identity_q.put(labeled)  # ← writes identity_q
-
-
-# now it will go to asr for identity resolver.
+            await self.bus.labeled_turn_q.put(labeled)  # ← writes labeled_turn_q directly

@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     # swapped to OLLAMA_FALLBACK_MODEL for the rest of the process — every call
     # site reads settings.OLLAMA_MODEL, so they all pick up the fallback
     # automatically with no per-call-site changes needed.
-    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL") or "qwen3.5:4b"
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL") or "qwen2.5:3b"
     OLLAMA_FALLBACK_MODEL: str = os.getenv("OLLAMA_FALLBACK_MODEL") or "qwen2.5:7b"
     OLLAMA_BASE_URL: str = "http://127.0.0.1:11434"
     # Hard ceiling on a single classify() call to Ollama. Without this, a slow
@@ -113,9 +113,9 @@ class Settings(BaseSettings):
     AMADEUS_CLIENT_SECRET: Optional[str] = os.getenv("AMADEUS_CLIENT_SECRET")
 
     # Speaker identity
-    COSINE_THRESHOLD: float = 0.50
+    COSINE_THRESHOLD: float = 0.6
     COSINE_MARGIN: float = 0.05
-    EMBEDDING_DIM: int = 512
+    EMBEDDING_DIM: int = 256
 
     # Queue sizes (back-pressure)
     RAW_AUDIO_Q_SIZE: int = 100

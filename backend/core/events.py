@@ -15,7 +15,6 @@ async def startup_pipeline():
     from backend.pipeline.asr_worker import ASRWorker
     from backend.pipeline.diarizer import DiarizerWorker
     from backend.pipeline.front_llm import FrontLLMWorker
-    from backend.pipeline.identity_resolver import IdentityResolverWorker
     from backend.pipeline.vad.silero_vad import SileroVADWorker
     from backend.pipeline.vad.smart_turn import SmartTurnWorker
 
@@ -29,7 +28,6 @@ async def startup_pipeline():
         SileroVADWorker(bus),
         SmartTurnWorker(bus),
         DiarizerWorker(bus),
-        IdentityResolverWorker(bus),
         ASRWorker(bus),
         FrontLLMWorker(bus),
     ]

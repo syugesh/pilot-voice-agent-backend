@@ -1,20 +1,16 @@
 """
 Customer sentiment / frustration / urgency detection.
 
-Runs a small HuggingFace sentiment classifier (already-installed transformers
-+ torch — no new heavy dependency) on each *customer* transcript turn, then
-blends the model's negativity with lightweight linguistic urgency/frustration
-signals into a single frustration score the CSR dashboard can meter live.
-
-Model: cardiffnlp/twitter-roberta-base-sentiment-latest (~500MB, CPU-fine).
-Lazy-loaded singleton warmed on first use, same pattern as services/stt.py.
-If the model can't load (offline / no disk), degrades to a keyword-only
-heuristic so the pipeline never hard-fails on a missing download.
+Keyword/linguistic heuristic only — no HuggingFace model load. Previously
+ran cardiffnlp/twitter-roberta-base-sentiment-latest, removed since it was
+unused (Customer Resolution's sentiment meter is the only caller, and that
+feature is currently disabled from navigation — see GuidelinePageView.tsx)
+and its weights had stopped resolving on Hugging Face (404 on
+preprocessor_config.json), so every load attempt was just a wasted network
+round trip before falling back to this same heuristic anyway.
 """
 import asyncio, logging, re
 logger = logging.getLogger("pilot.sentiment")
-
-_MODEL_NAME = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 
 # Words/patterns that signal a customer is escalating regardless of raw polarity —
 # "still", "again", "three days" all imply repeated failure / duration, which is
@@ -30,36 +26,10 @@ _DURATION_RE = re.compile(r'\b(\d+)\s*(day|days|week|weeks|hour|hours|month|mont
 
 class SentimentProvider:
     def __init__(self):
-        self._pipe = None
-        self._loaded = False
-        self._available = False
+        pass
 
     def load(self):
-        if self._loaded:
-            return
-        self._loaded = True
-        try:
-            from transformers import pipeline
-            # top_k=None → return all class scores so we can read negative directly
-            self._pipe = pipeline("sentiment-analysis", model=_MODEL_NAME, top_k=None)
-            self._available = True
-            logger.info(f"Sentiment model ready → {_MODEL_NAME}")
-        except Exception as e:
-            logger.warning(f"Sentiment model unavailable ({e}) — using keyword heuristic fallback")
-            self._pipe = None
-            self._available = False
-
-    def _model_scores(self, text: str) -> dict[str, float]:
-        """{'negative': .., 'neutral': .., 'positive': ..} from the HF model."""
-        results = self._pipe(text[:512])
-        # pipeline(top_k=None) returns [[{label, score}, ...]] for a single input
-        rows = results[0] if results and isinstance(results[0], list) else results
-        out = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
-        for r in rows:
-            label = r["label"].lower()
-            if label in out:
-                out[label] = float(r["score"])
-        return out
+        pass
 
     def _keyword_negativity(self, text: str) -> float:
         """Fallback polarity when the model isn't available — crude but never zero-signal."""
@@ -109,20 +79,10 @@ class SentimentProvider:
         }
 
     def analyze_sync(self, text: str) -> dict:
-        if not self._loaded:
-            self.load()
         text = (text or "").strip()
         if not text:
             return {"sentiment": "neutral", "sentiment_score": 0.0, "frustration_score": 0.0, "urgency": "low"}
-        try:
-            if self._available:
-                scores = self._model_scores(text)
-                negativity = scores["negative"]
-            else:
-                negativity = self._keyword_negativity(text)
-        except Exception as e:
-            logger.warning(f"Sentiment inference error ({e}) — keyword fallback for this turn")
-            negativity = self._keyword_negativity(text)
+        negativity = self._keyword_negativity(text)
         return self._blend(text, negativity)
 
     async def analyze(self, text: str) -> dict:

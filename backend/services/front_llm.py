@@ -79,8 +79,16 @@ _ROUTE_MATCH_RE = re.compile(
     # single p, so \s* alone doesn't help — "planner" isn't even a substring
     # of "triplanner" anymore. Listed as an explicit literal alternate rather
     # than trying to generalize a fuzzy-merge rule for one observed case.
-    r'(trip\s*planner|triplanner|travel|ppt\s*copilot|presentation|powerpoint|customer\s*resolution|'
-    r'resolution|customer\s*care|meeting\s*feature|meeting|talkinia|dashboard|main\s*dashboard|'
+    #
+    # "PPT" spoken as letters is a common Whisper mishearing target — observed
+    # transcriptions include "ppd copilot", "pppt copilot", "pppd copilot",
+    # "ppp copilot", and more. These all share a shape (starts with "p",
+    # followed by 1-4 more p/t/d-sounding letters, then "copilot") rather
+    # than being one-off substitutions like "triplanner" above, so this is a
+    # fuzzy pattern (p[ptd]{1,4}) instead of an enumerated literal list —
+    # enumerating every mishearing variant one at a time doesn't scale.
+    r'(trip\s*planner|triplanner|travel|p[ptd]{1,4}\s*copilot|presentation|powerpoint|customer\s*resolution|'
+    r'resolution|customer\s*care|meet\s*room|meeting\s*feature|meeting|talkinia|dashboard|main\s*dashboard|'
     r'home|guidelines|guideline|system\s*guidelines|profile|settings)\b'
 )
 
@@ -103,13 +111,13 @@ def _match_navigate_page(normalized_text: str) -> dict | None:
     if dest in ("tripplanner", "triplanner", "travel"):
         page_id = "care"
         preamble = "Going to Trip Planner."
-    elif dest in ("pptcopilot", "presentation", "powerpoint"):
+    elif dest in ("presentation", "powerpoint") or re.match(r'^p[ptd]{1,4}copilot$', dest):
         page_id = "ppt"
         preamble = "Going to PPT Copilot."
     elif dest in ("customerresolution", "resolution", "customercare"):
         page_id = "resolution"
         preamble = "Going to Customer Resolution."
-    elif dest in ("meetingfeature", "meeting", "talkinia"):
+    elif dest in ("meetingfeature", "meeting", "talkinia", "meetroom"):
         page_id = "meetings"
         preamble = "Going to MeetRoom."
     elif dest in ("guideline", "guidelines", "systemguidelines"):
@@ -581,6 +589,23 @@ class FrontLLMProvider:
                 return {"action": "delegate", "preamble": preamble,
                         "tool": "ppt_generate_notes", "args": notes_args, "mode": "queue"}
 
+            # "summarize [the presentation/slide]" — deterministic, bypasses
+            # Ollama entirely. Without this, the classifier occasionally
+            # answers with a fake "Okay, I'll provide a summary..."
+            # acknowledgment under respond_now instead of actually
+            # delegating to ppt_summarize — _fix_respond_now_questions only
+            # catches question-shaped or >10-word fakes, and this phrasing
+            # is neither, so it slipped through with nothing ever spoken
+            # beyond the acknowledgment itself.
+            _is_summarize = bool(re.search(
+                r'\b(?:summarize|summarise|summary of|overview of|'
+                r'what(?:\'s| is) this (?:presentation|slide|about)|'
+                r'describe (?:the|this) (?:presentation|slide))\b', _tl
+            ))
+            if _is_summarize:
+                return {"action": "delegate", "preamble": "Let me summarize that for you!",
+                        "tool": "ppt_summarize", "args": {}, "mode": "queue"}
+
             if not _is_destructive:
                 _m = re.search(r'\bslide[s]?\s+(?:number\s+)?(\d+)\b', _tl)
                 if _m:
@@ -589,6 +614,28 @@ class FrontLLMProvider:
                             "tool": "ppt_jump_to_title",
                             "args": {"query": text, "slide_number": num - 1},
                             "mode": "queue"}
+
+                # Relative slide navigation ("next/previous/first/last slide")
+                # is just as deterministic as a numbered slide — no LLM
+                # judgment needed. This used to only exist in
+                # _keyword_fallback (Ollama-timeout-only), so whenever Ollama
+                # actually responded in time it had a free hand to guess and
+                # could misroute — e.g. "go to last slide" got classified as
+                # ppt_last_action ("what did I just change") instead of
+                # actually navigating. Checking it here, before Ollama, makes
+                # it always correct regardless of whether Ollama succeeds.
+                if re.search(r'\b(?:next|forward)\s+slide\b|\bgo\s+forward\b|\badvance\b', _tl):
+                    return {"action": "delegate", "preamble": "Moving forward!",
+                            "tool": "ppt_navigate", "args": {"direction": "next"}, "mode": "queue"}
+                if re.search(r'\b(?:previous|prev|back)\s+slide\b|\bgo\s+back\b', _tl):
+                    return {"action": "delegate", "preamble": "Going back!",
+                            "tool": "ppt_navigate", "args": {"direction": "prev"}, "mode": "queue"}
+                if re.search(r'\bfirst\s+slide\b|\bgo\s+to\s+(?:the\s+)?start\b|\bbeginning\b', _tl):
+                    return {"action": "delegate", "preamble": "Back to the start!",
+                            "tool": "ppt_navigate", "args": {"direction": "first"}, "mode": "queue"}
+                if re.search(r'\blast\s+slide\b|\bgo\s+to\s+(?:the\s+)?end\b|\bfinal\s+slide\b|\bend\s+slide\b', _tl):
+                    return {"action": "delegate", "preamble": "Jumping to the end!",
+                            "tool": "ppt_navigate", "args": {"direction": "last"}, "mode": "queue"}
 
             # DISABLED: ppt_save_slide tool removed upstream (no replacement)
             # if any(w in _tl for w in ("save slide", "save changes", "save presentation", "save the slide", "save the presentation")):
@@ -837,6 +884,8 @@ class FrontLLMProvider:
                 r = response.copy()
                 r["args"] = dict(response["args"])
                 if r.get("tool") == "kb_search":
+                    r["args"]["query"] = text
+                if r.get("tool") == "general_qa":
                     r["args"]["query"] = text
                 if r.get("tool") == "ticket_create":
                     r["args"] = {"category": "general", "synopsis": text, "symptoms": ""}

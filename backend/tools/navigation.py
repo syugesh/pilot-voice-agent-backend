@@ -14,7 +14,7 @@ VALID_PAGES = {"dashboard", "ppt", "care", "resolution", "meetings", "guideline"
 PAGE_LABELS = {
     "dashboard":  "the Main Dashboard",
     "ppt":        "PPT Copilot",
-    "care":       "Trip Planner",
+    "care":       "Travel Planner",
     "resolution": "Customer Resolution",
     "meetings":   "MeetRoom",
     "guideline":  "System Guidelines",

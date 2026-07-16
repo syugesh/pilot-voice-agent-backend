@@ -3764,9 +3764,23 @@ Topic: {topic}"""
 # priority scheduling, and only runs at all once both cloud legs are
 # unavailable or fail.
 
+# Once a Gemini call fails with a quota-shaped error (429 / "quota"/"limit"
+# in the message), skip Gemini entirely for this cooldown window instead of
+# retrying a call that's going to fail again — every skipped attempt saves
+# a full network round trip off the cascade's latency. Reset automatically
+# once the cooldown passes, in case the quota resets or gets upgraded.
+_GEMINI_QUOTA_COOLDOWN_S = 600
+_gemini_broken_until = 0.0
+
+
 async def _try_gemini_text(prompt: str, model: str = "gemini-2.0-flash") -> str | None:
+    import time
+
+    global _gemini_broken_until
     from backend.core.config import settings
     if not settings.GEMINI_API_KEY:
+        return None
+    if time.time() < _gemini_broken_until:
         return None
     try:
         import google.generativeai as genai
@@ -3775,7 +3789,12 @@ async def _try_gemini_text(prompt: str, model: str = "gemini-2.0-flash") -> str 
         resp = await gen_model.generate_content_async(prompt)
         return resp.text.strip()
     except Exception as e:
-        logger.warning(f"Gemini call failed: {e}")
+        msg = str(e).lower()
+        if "429" in msg or "quota" in msg or "rate limit" in msg:
+            _gemini_broken_until = time.time() + _GEMINI_QUOTA_COOLDOWN_S
+            logger.warning(f"Gemini quota exceeded — skipping Gemini for {_GEMINI_QUOTA_COOLDOWN_S}s: {e}")
+        else:
+            logger.warning(f"Gemini call failed: {e}")
         return None
 
 

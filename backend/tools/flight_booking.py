@@ -427,16 +427,33 @@ def _detect_currency(raw_text: str) -> str:
     return "$" if usd_hits > inr_hits else "₹"
 
 
+# Words that mean a nearby currency-prefixed number is a promo/discount/tax
+# amount, not the fare itself — e.g. "Get extra Rs.220 instant discount on
+# this flight" genuinely matches the ₹ price regex, but 220 is a discount,
+# not a fare, and taking the FIRST match in the text (as a plain .search()
+# does) picks exactly this kind of number when the real fare happens to
+# appear elsewhere in the snippet as a bare, unprefixed number.
+_PRICE_EXCLUSION_RE = re.compile(
+    r"\b(off|discount|cashback|coupon|code|save|extra|instant)\b", re.IGNORECASE
+)
+_PRICE_CONTEXT_WINDOW = 25  # chars of surrounding text to check for exclusion words
+
+
 def _extract_price(snippet_and_title: str, currency: str) -> Optional[str]:
     """Extract a real fare from scraped text in the given currency. Returns
     None (never a made-up number) if that currency's pattern genuinely isn't
     present in the text — callers must handle that by omitting the price,
-    not inventing one."""
-    if currency == "$":
-        m = _USD_PRICE_RE.search(snippet_and_title)
-        return f"${m.group(1)}" if m else None
-    m = _INR_PRICE_RE.search(snippet_and_title)
-    return f"₹{m.group(1)}" if m else None
+    not inventing one. Skips matches sitting next to discount/promo language
+    so a coupon amount doesn't get picked up as if it were the fare."""
+    pattern = _USD_PRICE_RE if currency == "$" else _INR_PRICE_RE
+    for m in pattern.finditer(snippet_and_title):
+        start = max(0, m.start() - _PRICE_CONTEXT_WINDOW)
+        end = min(len(snippet_and_title), m.end() + _PRICE_CONTEXT_WINDOW)
+        context = snippet_and_title[start:end]
+        if _PRICE_EXCLUSION_RE.search(context):
+            continue
+        return f"{currency}{m.group(1)}"
+    return None
 
 
 _KNOWN_AIRLINES = [
@@ -658,15 +675,18 @@ async def _search_duffel(origin_iata: str, dest_iata: str, date: str) -> list[di
 
             parsed_results = []
             for idx, offer in enumerate(offers[:15]):
-                first_slice = offer.get("slices", [{}])[0]
-                segments = first_slice.get("segments", [])
+                slices = offer.get("slices") or [{}]
+                first_slice = slices[0] if slices else {}
+                segments = first_slice.get("segments") or []
+                if not segments:
+                    continue
                 
                 # Calculate layovers between segments
                 layovers = []
                 for i in range(len(segments) - 1):
                     arr_time = segments[i].get("arriving_at")
                     dep_time = segments[i+1].get("departing_at")
-                    layover_airport = segments[i].get("destination", {})
+                    layover_airport = segments[i].get("destination") or {}
                     
                     try:
                         import datetime as dt
@@ -686,10 +706,16 @@ async def _search_duffel(origin_iata: str, dest_iata: str, date: str) -> list[di
                 # Format each segment
                 parsed_segments = []
                 for seg in segments:
-                    carrier = seg.get("marketing_carrier", {})
+                    # Duffel sends these keys with an explicit JSON `null` for
+                    # some segments (e.g. aircraft/carrier not yet assigned) —
+                    # dict.get(key, default) only falls back when the key is
+                    # MISSING, not when it's present-but-null, so `or {}` is
+                    # required here to avoid a NoneType crash on the chained
+                    # .get() below.
+                    carrier = seg.get("marketing_carrier") or {}
                     carrier_code = carrier.get("iata_code", "FL")
                     flight_no = seg.get("marketing_carrier_flight_number", "100")
-                    aircraft_name = seg.get("aircraft", {}).get("name") or "Airbus A321neo"
+                    aircraft_name = (seg.get("aircraft") or {}).get("name") or "Airbus A321neo"
                     
                     dep_t = seg.get("departing_at", "12:00")
                     arr_t = seg.get("arriving_at", "14:30")
@@ -709,10 +735,10 @@ async def _search_duffel(origin_iata: str, dest_iata: str, date: str) -> list[di
                     parsed_segments.append({
                         "airline": carrier.get("name") or "Airline",
                         "flightCode": f"{carrier_code} {flight_no}",
-                        "fromCode": seg.get("origin", {}).get("iata_code", "MAA"),
-                        "fromName": seg.get("origin", {}).get("name", "Airport"),
-                        "toCode": seg.get("destination", {}).get("iata_code", "DEL"),
-                        "toName": seg.get("destination", {}).get("name", "Airport"),
+                        "fromCode": (seg.get("origin") or {}).get("iata_code", "MAA"),
+                        "fromName": (seg.get("origin") or {}).get("name", "Airport"),
+                        "toCode": (seg.get("destination") or {}).get("iata_code", "DEL"),
+                        "toName": (seg.get("destination") or {}).get("name", "Airport"),
                         "departureTime": dep_t,
                         "arrivalTime": arr_t,
                         "duration": dur_str,
@@ -1262,6 +1288,24 @@ def _extract_hotels_from_content(content: str, place_label: str) -> list[dict]:
             r"best hotels for|top picks)\b", name, re.IGNORECASE
         ):
             return
+        # A single hotel's OWN website (not a multi-property listing page)
+        # uses this exact same ##/### header shape for its internal
+        # room-type/facility/policy sections ("Meetings & Conferences",
+        # "Deluxe City View", "Executive Suite", "Single Occupancy") — these
+        # match the header pattern just as well as a real distinct hotel
+        # name would, but they're all sections of ONE property, not several
+        # different hotels. A booking-policy date range ("1st November, 2022
+        # till 31st December, 2025") can end up as a header too.
+        if re.search(
+            r"\b(room type|check rates|room gallery|property\s*&|"
+            r"single occupancy|double occupancy|triple occupancy|"
+            r"deluxe\s|premier\s(?:room|suite)|club\s(?:room|suite)|"
+            r"executive\s(?:room|suite)|presidential\s(?:room|suite)|"
+            r"meetings?\s*&?\s*conferences?|spa\s*&?\s*wellness|"
+            r"banquet(?:s|ing)?)\b",
+            name, re.IGNORECASE,
+        ) or re.search(r"\b(19|20)\d{2}\b.*\btill\b|\btill\b.*\b(19|20)\d{2}\b", name, re.IGNORECASE):
+            return
         if not _looks_like_hotel_name(name):
             return
         # Dedup key from the CLEANED name (leading "15. "/trailing "Hotel"
@@ -1742,34 +1786,66 @@ async def search_train_full_route(train_code: str, train_name: str, origin: str,
         logger.warning(f"Train full-route search error for {train_code}: {e}")
         return {"stops": [], "source": None}
 
-    text = (data.get("answer") or "") + " " + " ".join(
-        (r.get("raw_content") or r.get("content") or "") for r in (data.get("results") or [])
-    )
+    # Score each result separately (never concatenated into one blob) — a
+    # multi-result Tavily search commonly returns pages for OTHER trains on
+    # overlapping parts of the same route, or generic route-comparison pages
+    # that name several trains at once. Concatenating everything before
+    # scanning let station names from those unrelated pages bleed into this
+    # train's stop list (inflating it past its real stop count) while a
+    # fixed 20-stop cap simultaneously truncated genuinely long routes
+    # (real Indian long-distance trains commonly have 30-50+ stops). Instead,
+    # each result is scanned on its own, and results that actually name this
+    # specific train (by code or name) are strongly preferred — a much more
+    # reliable signal that its content is really this train's own route
+    # table, not a different train's or a generic aggregator page.
+    def _extract_from_text(text: str) -> list[dict]:
+        found: list[dict] = []
+        seen_l: set[str] = set()
+        seen_codes: set[str] = set()
+        for m in _ROUTE_STOP_RE.finditer(text):
+            name = re.sub(r"\s+", " ", m.group(1)).strip(" .-")
+            code = m.group(2).strip().upper()
+            name_l = name.lower()
+            if (
+                name_l in seen_l or code in seen_codes
+                or code in _ROUTE_STOP_CODE_BLOCKLIST
+                or name_l in origin_l or origin_l in name_l
+                or name_l in dest_l or dest_l in name_l
+                or any(bad in name_l for bad in _ROUTE_STOP_JUNK)
+                or len(name) < 3 or len(name) > 40
+                or len(name.split()) > 3  # real station names are 1-3 words; longer is prose bleed
+            ):
+                continue
+            seen_l.add(name_l)
+            seen_codes.add(code)
+            time_m = _NEARBY_TIME_RE.search(text[m.end():])
+            found.append({"station": name.title(), "code": code, "time": time_m.group(1) if time_m else None})
+            if len(found) >= 60:  # real long-distance trains rarely exceed this
+                break
+        return found
 
-    stops: list[dict] = []
-    seen = set()
-    seen_codes: set[str] = set()
     origin_l, dest_l = origin.strip().lower(), destination.strip().lower()
-    for m in _ROUTE_STOP_RE.finditer(text):
-        name = re.sub(r"\s+", " ", m.group(1)).strip(" .-")
-        code = m.group(2).strip().upper()
-        name_l = name.lower()
-        if (
-            name_l in seen or code in seen_codes
-            or code in _ROUTE_STOP_CODE_BLOCKLIST
-            or name_l in origin_l or origin_l in name_l
-            or name_l in dest_l or dest_l in name_l
-            or any(bad in name_l for bad in _ROUTE_STOP_JUNK)
-            or len(name) < 3 or len(name) > 40
-            or len(name.split()) > 3  # real station names are 1-3 words; longer is prose bleed
-        ):
+    train_code_l = train_code.strip().lower()
+    train_name_l = train_name.strip().lower()
+
+    on_topic_candidates: list[list[dict]] = []
+    other_candidates: list[list[dict]] = []
+    for r in (data.get("results") or []):
+        page_text = r.get("raw_content") or r.get("content") or ""
+        if not page_text:
             continue
-        seen.add(name_l)
-        seen_codes.add(code)
-        time_m = _NEARBY_TIME_RE.search(text[m.end():])
-        stops.append({"station": name.title(), "code": code, "time": time_m.group(1) if time_m else None})
-        if len(stops) >= 20:
-            break
+        found = _extract_from_text(page_text)
+        if not found:
+            continue
+        mentions_this_train = train_code_l in page_text.lower() or (
+            len(train_name_l) > 3 and train_name_l in page_text.lower()
+        )
+        (on_topic_candidates if mentions_this_train else other_candidates).append(found)
+
+    # Prefer the richest result that actually names this train; only fall
+    # back to a generic (not train-specific) page if nothing better exists.
+    candidates = on_topic_candidates or other_candidates
+    stops = max(candidates, key=len) if candidates else []
 
     return {"stops": stops, "source": "Live web search" if stops else None}
 
@@ -2248,30 +2324,9 @@ async def _flight_search_impl(args: dict, session_id: str) -> dict:
         f"Travel Search: service_type={service_type}, origin={origin}, destination={destination}, query={query}"
     )
 
-    # 1. Priority: Duffel API (flights only)
-    if service_type == "flights" and settings.DUFFEL_API_KEY:
-        logger.info(f"Priority 1: Querying Duffel API for {origin_iata} -> {dest_iata} on {date}")
-        duffel_results = await _search_duffel(origin_iata, dest_iata, date)
-        if duffel_results:
-            parts = []
-            for i, f in enumerate(duffel_results):
-                parts.append(
-                    f"{i + 1}. {f['airline']} ({f['flight']}) departing at {f['departure']} for {f['price']}"
-                )
-            spoken = f"I found {len(duffel_results)} live flights from {origin} to {destination} today.{nearest_airport_note} You can review them on screen."
-            text_content = f"Found {len(duffel_results)} live flights from {origin} to {destination} on {date}.\n\n" + "\n".join(parts)
-            return {
-                "status": "ok",
-                "service_type": service_type,
-                "origin": origin,
-                "destination": destination,
-                "date": date,
-                "results": duffel_results,
-                "source": "Duffel Live API",
-                "spoken_reply": spoken,
-                "text_reply": text_content,
-            }
-        logger.info("Duffel API returned no results or failed. Falling back to Tavily...")
+    # 1. Priority: Tavily (moved ahead of Duffel — see the flights branch of
+    # the Tavily-parsing block below; Duffel now runs there as the fallback
+    # if Tavily comes up empty, instead of running first).
 
     # 1b. Hotels — real, geolocation-based search (Amadeus prices, else Google
     # Places). Handled as its own priority stage, ahead of the legacy Tavily/
@@ -2437,104 +2492,237 @@ async def _flight_search_impl(args: dict, session_id: str) -> dict:
     if not tavily_results and service_type in ("trains", "hotels"):
         tavily_results = [{}]
 
-        if tavily_results:
-            if service_type == "flights":
-                # NOTE: a prior "Google Maps MCP" branch used to sit here, repurposing
-                # Google Maps' transit-directions API (buses/trains) as a flight-fare
-                # source. It doesn't return flight fares at all — the price was a bare
-                # arithmetic formula, never anything extracted from a real response —
-                # so it's removed rather than "fixed"; there was nothing genuine to fix.
+    if tavily_results:
+        if service_type == "flights":
+            # NOTE: a prior "Google Maps MCP" branch used to sit here, repurposing
+            # Google Maps' transit-directions API (buses/trains) as a flight-fare
+            # source. It doesn't return flight fares at all — the price was a bare
+            # arithmetic formula, never anything extracted from a real response —
+            # so it's removed rather than "fixed"; there was nothing genuine to fix.
 
-                results = tavily_results
-                # Decide the ONE currency to extract in for this whole batch, based
-                # on what the response actually contains — not guessed from the
-                # route, since even a domestic Indian route can come back USD-priced
-                # depending on the source page's locale (seen in practice).
-                currency = _detect_currency(" ".join(
-                    f"{r.get('title','')} {r.get('snippet') or r.get('content') or ''}" for r in results
-                ))
-                parts = []
-                tavily_flights = []
-                for r in results:
+            results = tavily_results
+            # Decide the ONE currency to extract in for this whole batch, based
+            # on what the response actually contains — not guessed from the
+            # route, since even a domestic Indian route can come back USD-priced
+            # depending on the source page's locale (seen in practice).
+            currency = _detect_currency(" ".join(
+                f"{r.get('title','')} {r.get('snippet') or r.get('content') or ''}" for r in results
+            ))
+            parts = []
+            tavily_flights = []
+            for r in results:
+                if len(tavily_flights) >= 15:
+                    break
+                raw_title = r.get("title") or ""
+                title = re.sub(r"\s+", " ", raw_title).replace("###", "").strip()
+                raw_snippet = r.get("snippet") or r.get("content") or ""
+
+                # Aggregator pages (e.g. Google Flights) sometimes come back as a
+                # genuine pipe-delimited fare table baked into the snippet — real
+                # structured data, not prose. Try that first; it can yield several
+                # real flights from a single search hit. Table parsing needs the
+                # RAW snippet (newline-delimited rows) before whitespace collapsing.
+                for row in _parse_flight_table_rows(raw_snippet, currency):
                     if len(tavily_flights) >= 15:
                         break
-                    raw_title = r.get("title") or ""
-                    title = re.sub(r"\s+", " ", raw_title).replace("###", "").strip()
-                    raw_snippet = r.get("snippet") or r.get("content") or ""
-
-                    # Aggregator pages (e.g. Google Flights) sometimes come back as a
-                    # genuine pipe-delimited fare table baked into the snippet — real
-                    # structured data, not prose. Try that first; it can yield several
-                    # real flights from a single search hit. Table parsing needs the
-                    # RAW snippet (newline-delimited rows) before whitespace collapsing.
-                    for row in _parse_flight_table_rows(raw_snippet, currency):
-                        if len(tavily_flights) >= 15:
-                            break
-                        flight_data = _generate_flight_segments(
-                            origin=origin,
-                            destination=destination,
-                            airline=row["airline"],
-                            flight_code=f"FL-{100 + len(tavily_flights)}",
-                            departure=f"{8 + len(tavily_flights) * 2:02d}:30",
-                            price=row["price"],
-                            stops=row["stops"],
-                            idx=len(tavily_flights),
-                            origin_code=origin_iata, dest_code_override=dest_iata,
-                        )
-                        tavily_flights.append(flight_data)
-                        parts.append(f"{len(tavily_flights)}. {flight_data['airline']} ({flight_data['flight']}) for {flight_data['price']} | Class: Economy | Duration: {flight_data['duration']} | Rating: 4.2/5")
-                    if len(tavily_flights) >= 15:
-                        break
-
-                    snippet = re.sub(r"\s+", " ", raw_snippet).replace("###", "").strip()
-                    combined = f"{snippet} {title}"
-
-                    code_match = re.search(r"\b((?:6E|AI|IX|QP|UK|SG|G8)-?\d{3,4})\b", combined, re.IGNORECASE)
-                    code_val = code_match.group(1).upper() if code_match else ""
-
-                    airline = _extract_airline(title, snippet, code_val)
-                    price_val = _extract_price(combined, currency)
-                    if not airline or not price_val:
-                        # Not a genuine, parseable flight listing (e.g. a news
-                        # article that merely mentions an airline) — drop it
-                        # rather than invent a plausible-looking card for it.
-                        continue
-
-                    time_match = re.search(r"\b(\d{2}:\d{2})\b", combined)
-                    time_val = time_match.group(1) if time_match else f"{8 + len(tavily_flights) * 2:02d}:30"
-
-                    stops = 1 if len(tavily_flights) % 2 == 1 else 0
                     flight_data = _generate_flight_segments(
                         origin=origin,
                         destination=destination,
-                        airline=airline,
-                        flight_code=code_val or f"FL-{100 + len(tavily_flights)}",
-                        departure=time_val,
-                        price=price_val,
-                        stops=stops,
+                        airline=row["airline"],
+                        flight_code=f"FL-{100 + len(tavily_flights)}",
+                        departure=f"{8 + len(tavily_flights) * 2:02d}:30",
+                        price=row["price"],
+                        stops=row["stops"],
                         idx=len(tavily_flights),
                         origin_code=origin_iata, dest_code_override=dest_iata,
                     )
                     tavily_flights.append(flight_data)
-                    parts.append(f"{len(tavily_flights)}. {flight_data['airline']} ({flight_data['flight']}) departing at {flight_data['departure']} for {flight_data['price']} | Class: Economy | Duration: {flight_data['duration']} | Rating: 4.2/5")
+                    parts.append(f"{len(tavily_flights)}. {flight_data['airline']} ({flight_data['flight']}) for {flight_data['price']} | Class: Economy | Duration: {flight_data['duration']} | Rating: 4.2/5")
+                if len(tavily_flights) >= 15:
+                    break
 
-                if tavily_flights:
-                    text_content = f"Found {len(tavily_flights)} flights from {origin} to {destination} on {date}.\n\n" + "\n".join(parts)
-                    spoken = f"I found {len(tavily_flights)} flight option{'s' if len(tavily_flights) != 1 else ''} from {origin} to {destination} on {date} from live web search.{nearest_airport_note} You can review them on the screen."
+                snippet = re.sub(r"\s+", " ", raw_snippet).replace("###", "").strip()
+                combined = f"{snippet} {title}"
+
+                code_match = re.search(r"\b((?:6E|AI|IX|QP|UK|SG|G8)-?\d{3,4})\b", combined, re.IGNORECASE)
+                code_val = code_match.group(1).upper() if code_match else ""
+
+                airline = _extract_airline(title, snippet, code_val)
+                price_val = _extract_price(combined, currency)
+                if not airline or not price_val:
+                    # Not a genuine, parseable flight listing (e.g. a news
+                    # article that merely mentions an airline) — drop it
+                    # rather than invent a plausible-looking card for it.
+                    continue
+
+                time_match = re.search(r"\b(\d{2}:\d{2})\b", combined)
+                time_val = time_match.group(1) if time_match else f"{8 + len(tavily_flights) * 2:02d}:30"
+
+                stops = 1 if len(tavily_flights) % 2 == 1 else 0
+                flight_data = _generate_flight_segments(
+                    origin=origin,
+                    destination=destination,
+                    airline=airline,
+                    flight_code=code_val or f"FL-{100 + len(tavily_flights)}",
+                    departure=time_val,
+                    price=price_val,
+                    stops=stops,
+                    idx=len(tavily_flights),
+                    origin_code=origin_iata, dest_code_override=dest_iata,
+                )
+                tavily_flights.append(flight_data)
+                parts.append(f"{len(tavily_flights)}. {flight_data['airline']} ({flight_data['flight']}) departing at {flight_data['departure']} for {flight_data['price']} | Class: Economy | Duration: {flight_data['duration']} | Rating: 4.2/5")
+
+            if tavily_flights:
+                text_content = f"Found {len(tavily_flights)} flights from {origin} to {destination} on {date}.\n\n" + "\n".join(parts)
+                spoken = f"I found {len(tavily_flights)} flight option{'s' if len(tavily_flights) != 1 else ''} from {origin} to {destination} on {date} from live web search.{nearest_airport_note} You can review them on the screen."
+                return {
+                    "status": "ok",
+                    "service_type": service_type,
+                    "origin": origin,
+                    "destination": destination,
+                    "date": date,
+                    "results": tavily_flights,
+                    "source": "Tavily Web Search",
+                    "spoken_reply": spoken,
+                    "text_reply": text_content,
+                }
+            logger.info("Tavily search returned results but none were genuinely parseable as flight listings. Falling back to Duffel...")
+
+            # 2. Fallback: Duffel API (flights only) — tried after Tavily
+            # since Tavily is now primary; unchanged Duffel-call logic,
+            # just relocated from its old priority-1 spot above.
+            if settings.DUFFEL_API_KEY:
+                logger.info(f"Falling back to Duffel API for {origin_iata} -> {dest_iata} on {date}")
+                duffel_results = await _search_duffel(origin_iata, dest_iata, date)
+                if duffel_results:
+                    parts = []
+                    for i, f in enumerate(duffel_results):
+                        parts.append(
+                            f"{i + 1}. {f['airline']} ({f['flight']}) departing at {f['departure']} for {f['price']}"
+                        )
+                    spoken = f"I found {len(duffel_results)} live flights from {origin} to {destination} today.{nearest_airport_note} You can review them on screen."
+                    text_content = f"Found {len(duffel_results)} live flights from {origin} to {destination} on {date}.\n\n" + "\n".join(parts)
                     return {
                         "status": "ok",
                         "service_type": service_type,
                         "origin": origin,
                         "destination": destination,
                         "date": date,
-                        "results": tavily_flights,
-                        "source": "Tavily Web Search",
+                        "results": duffel_results,
+                        "source": "Duffel Live API",
                         "spoken_reply": spoken,
                         "text_reply": text_content,
                     }
-                logger.info("Tavily search returned results but none were genuinely parseable as flight listings. Falling back to MCP/Mock...")
-            elif service_type == "hotels":
-                # Check for specific venues to perform a high-quality proximity search
+                logger.info("Duffel API also returned no results. Falling back to MCP/Mock...")
+        elif service_type == "hotels":
+            # Check for specific venues to perform a high-quality proximity search
+            origin_clean = origin.strip().lower().replace(",", " ").split()
+            MAJOR_CITIES = {"chennai", "mumbai", "kolkata", "calcutta", "delhi", "bengaluru", "bangalore", "hyderabad", "london", "dubai", "singapore", "tokyo", "goa", "pune", "ahmedabad", "jaipur", "kochi", "lucknow"}
+            is_specific = (
+                origin.strip().lower() not in MAJOR_CITIES
+                or len(origin_clean) > 1
+                or "," in origin
+                or any(x in origin.lower() for x in ["zone", "park", "street", "road", "mall", "airport", "station", "building", "tech", "office", "embassy", "university", "hospital", "nagar", "pallavarm", "pallavaram", "velachery", "guindy", "omr", "ecr", "mylapore", "tambaram", "adyar"])
+            )
+            if is_specific:
+                logger.info(f"[HOTEL PROXIMITY] Performing proximity search for location: {origin}")
+                parsed_hotels = _generate_proximity_hotels(origin)
+                parts = [f"{i+1}. {h['name']} in {origin} starting at {h['price']} | Rating: {h.get('rating', '4.2 ★')} | Highlights: {h.get('desc', 'A premium lodging stay near your location.')} | Amenities: {', '.join(h.get('amenities', []))}" for i, h in enumerate(parsed_hotels)]
+                text_content = f"Found {len(parsed_hotels)} hotels in {origin} on {date}.\n\n" + "\n".join(parts)
+                spoken = f"I successfully located {len(parsed_hotels)} hotel options near {origin} sorted by distance and price. You can review them on screen."
+                return {
+                    "status": "ok",
+                    "service_type": service_type,
+                    "origin": origin,
+                    "destination": destination,
+                    "date": date,
+                    "results": parsed_hotels,
+                    "source": "Local Proximity Search",
+                    "spoken_reply": spoken,
+                    "text_reply": text_content,
+                }
+
+            # ── Priority 1: Google Maps MCP Hotels (Places API) ──
+            if settings.GOOGLE_MAPS_API_KEY:
+                logger.info(f"[HOTEL MCP] Trying Google Maps searchPlaces for hotels in {origin}")
+                try:
+                    gm_result = await call_mcp_tool_async(
+                        server_cmd="npx",
+                        server_args=["-y", "@gongrzhe/server-travelplanner-mcp"],
+                        tool_name="searchPlaces",
+                        arguments={
+                            "query": f"hotels in {origin}",
+                        },
+                    )
+                    if gm_result.get("status") == "success":
+                        content = gm_result.get("content", {})
+                        places = []
+                        if isinstance(content, list):
+                            places = content
+                        elif isinstance(content, dict):
+                            places = content.get("results", []) or content.get("places", []) or []
+
+                        mcp_hotels = []
+                        image_tasks = []
+                        for idx, p in enumerate(places[:5]):
+                            name = p.get("name", "Premium Hotel")
+                            rating_val = p.get("rating", 4.0)
+                            review_count = p.get("user_ratings_total") or p.get("userRatingCount") or 150
+                            formatted_address = p.get("formatted_address") or p.get("formattedAddress") or origin
+                                
+                            photos = p.get("photos", []) or p.get("photo", []) or []
+                            photo_urls = []
+                            if photos and isinstance(photos, list) and settings.GOOGLE_MAPS_API_KEY:
+                                for ph in photos[:3]:
+                                    ref = ph.get("photo_reference") or ph.get("photoReference")
+                                    if ref:
+                                        photo_urls.append(f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photoreference={ref}&key={settings.GOOGLE_MAPS_API_KEY}")
+                                
+                            mcp_hotels.append({
+                                "id": f"HTL_GM_{idx + 1}",
+                                "name": name,
+                                "location": formatted_address,
+                                "rating": f"{rating_val} ★ ({review_count} reviews)",
+                                "price": f"₹{4500 + idx * 800}/night",
+                                "phone": "1800-102-3000",
+                                "desc": f"Highly rated hotel in {origin}. Address: {formatted_address}.",
+                                "images": photo_urls or CURATED_HOTEL_IMAGES[idx % len(CURATED_HOTEL_IMAGES)],
+                                "amenities": ["Free Wi-Fi", "Air conditioning", "Room service"]
+                            })
+                                
+                            if not photo_urls:
+                                image_tasks.append((idx, _get_real_hotel_images(name)))
+                                    
+                        if image_tasks:
+                            idxs, tasks = zip(*image_tasks)
+                            fetched_images = await asyncio.gather(*tasks)
+                            for i, imgs in zip(idxs, fetched_images):
+                                if imgs:
+                                    mcp_hotels[i]["images"] = imgs
+                        if mcp_hotels:
+                            parts = [f"{i+1}. {h['name']} in {origin} starting at {h['price']}" for i, h in enumerate(mcp_hotels)]
+                            text_content = f"Found {len(mcp_hotels)} hotels in {origin} on {date}.\n\n" + "\n".join(parts)
+                            spoken = f"I successfully located {len(mcp_hotels)} hotel options in {origin} today via Google Places. You can review them on screen."
+                            return {
+                                "status": "ok",
+                                "service_type": service_type,
+                                "origin": origin,
+                                "destination": destination,
+                                "date": date,
+                                "results": mcp_hotels,
+                                "source": "Google Places MCP",
+                                "spoken_reply": spoken,
+                                "text_reply": text_content,
+                            }
+                except Exception as gm_err:
+                    logger.warning(f"[HOTEL MCP] Google Maps MCP error: {gm_err}")
+
+            results = tavily_results
+            real_hotels = _filter_hotel_results(results)
+            parsed_hotels = []
+            if real_hotels:
+                # Determine proximity/distance assignment
                 origin_clean = origin.strip().lower().replace(",", " ").split()
                 MAJOR_CITIES = {"chennai", "mumbai", "kolkata", "calcutta", "delhi", "bengaluru", "bangalore", "hyderabad", "london", "dubai", "singapore", "tokyo", "goa", "pune", "ahmedabad", "jaipur", "kochi", "lucknow"}
                 is_specific = (
@@ -2543,504 +2731,398 @@ async def _flight_search_impl(args: dict, session_id: str) -> dict:
                     or "," in origin
                     or any(x in origin.lower() for x in ["zone", "park", "street", "road", "mall", "airport", "station", "building", "tech", "office", "embassy", "university", "hospital", "nagar", "pallavarm", "pallavaram", "velachery", "guindy", "omr", "ecr", "mylapore", "tambaram", "adyar"])
                 )
-                if is_specific:
-                    logger.info(f"[HOTEL PROXIMITY] Performing proximity search for location: {origin}")
-                    parsed_hotels = _generate_proximity_hotels(origin)
-                    parts = [f"{i+1}. {h['name']} in {origin} starting at {h['price']} | Rating: {h.get('rating', '4.2 ★')} | Highlights: {h.get('desc', 'A premium lodging stay near your location.')} | Amenities: {', '.join(h.get('amenities', []))}" for i, h in enumerate(parsed_hotels)]
-                    text_content = f"Found {len(parsed_hotels)} hotels in {origin} on {date}.\n\n" + "\n".join(parts)
-                    spoken = f"I successfully located {len(parsed_hotels)} hotel options near {origin} sorted by distance and price. You can review them on screen."
-                    return {
-                        "status": "ok",
-                        "service_type": service_type,
+
+                # Parse and return real-time hotels
+                for idx, r in enumerate(real_hotels[:5]):
+                    title_raw = r.get("title") or r.get("name") or r.get("hotel") or "Premium Hotel"
+                    title = re.sub(r"\s+", " ", title_raw).replace("###", "").strip()
+                    snippet_raw = r.get("snippet") or r.get("content") or ""
+                    snippet = re.sub(r"\s+", " ", snippet_raw).replace("###", "").strip()
+                        
+                    clean_title = r.get("clean_name") or title.split(" - ")[0].split(" | ")[0].strip()
+                    clean_title = re.sub(r"\b(cheap hotels|hotel booking|hotels|in|at|room|stay)\b", "", clean_title, flags=re.IGNORECASE).strip(" ,.!?")
+                    clean_title = re.sub(r"[0-9$₹%@+|,.:;*#&!?()\[\]_]", " ", clean_title)
+                    clean_title = re.sub(r"\s+", " ", clean_title).strip()
+
+                    # Extract price or compile a dynamic rate
+                    p_match = re.search(r"(?:₹|Rs\.?|INR)\s*(\d{1,3}(?:,\d{3})+|\d+)", snippet + " " + title)
+                    price_val = f"₹{p_match.group(1)}/night" if p_match else f"₹{3500 + idx*1200:,}/night"
+
+                    # Distance from search location
+                    dist_val = 0.5 + idx * 0.6
+                    location_val = f"{dist_val:.1f} km from {origin.strip().title()}" if is_specific else origin.strip().title()
+
+                    parsed_hotels.append({
+                        "id": f"HTL{idx + 1}",
+                        "name": clean_title,
+                        "location": location_val,
+                        "rating": f"{4.2 + (idx % 3)*0.2:.1f} ★ ({120 + idx*40} reviews)",
+                        "price": price_val,
+                        "phone": f"1800-102-{3000 + idx * 150}",
+                        "desc": snippet[:150] + "..." if len(snippet) > 150 else (snippet or f"Welcome to premium hospitality near {origin.strip().title()}."),
+                        "images": CURATED_HOTEL_IMAGES[idx % len(CURATED_HOTEL_IMAGES)],
+                        "amenities": ["Free Wi-Fi", "Air conditioning", "Room service"]
+                    })
+
+                # Fetch real hotel images concurrently
+                image_tasks = [(i, _get_real_hotel_images(h["name"])) for i, h in enumerate(parsed_hotels)]
+                if image_tasks:
+                    idxs, tasks = zip(*image_tasks)
+                    fetched_images = await asyncio.gather(*tasks)
+                    for i, imgs in zip(idxs, fetched_images):
+                        if imgs:
+                            parsed_hotels[i]["images"] = imgs
+
+                # Pad to exactly 5 results if needed
+                if len(parsed_hotels) < 5:
+                    needed = 5 - len(parsed_hotels)
+                    proximity_fallbacks = _generate_proximity_hotels(origin)
+                    seen_names = {h["name"].lower() for h in parsed_hotels}
+                    added = 0
+                    for h in proximity_fallbacks:
+                        if added >= needed:
+                            break
+                        if h["name"].lower() not in seen_names:
+                            h["id"] = f"HTL{len(parsed_hotels) + 1}"
+                            parsed_hotels.append(h)
+                            seen_names.add(h["name"].lower())
+                            added += 1
+            else:
+                parsed_hotels = _generate_proximity_hotels(origin)
+                
+            parts = [f"{i+1}. {h['name']} in {origin} starting at {h['price']} | Rating: {h.get('rating', '4.2 ★')} | Highlights: {h.get('desc', 'A high-end lodging stay.')} | Amenities: {', '.join(h.get('amenities', [])) if isinstance(h.get('amenities'), list) else h.get('amenities', '')}" for i, h in enumerate(parsed_hotels)]
+            text_content = f"Found {len(parsed_hotels)} hotels in {origin} on {date}.\n\n" + "\n".join(parts)
+            spoken = f"I successfully located {len(parsed_hotels)} hotel options in {origin} today. You can review them on screen."
+                
+            return {
+                "status": "ok",
+                "service_type": service_type,
+                "origin": origin,
+                "destination": destination,
+                "date": date,
+                "results": parsed_hotels,
+                "source": "Tavily Web Search",
+                "spoken_reply": spoken,
+                "text_reply": text_content,
+            }
+                
+        elif service_type == "trains":
+            results = tavily_results
+            train_class = args.get("train_class") or "AC First Class (1A)"
+            parsed_trains = []
+
+            orig_lower = origin.strip().lower()
+            dest_lower = destination.strip().lower()
+
+            # ── Priority 1: Google Maps API (transit directions) ──────────────
+            if settings.GOOGLE_MAPS_API_KEY and not parsed_trains:
+                logger.info(f"[TRAIN API] Trying Google Maps Directions API for {origin} → {destination}")
+                try:
+                    url = "https://maps.googleapis.com/maps/api/directions/json"
+                    params = {
                         "origin": origin,
                         "destination": destination,
-                        "date": date,
-                        "results": parsed_hotels,
-                        "source": "Local Proximity Search",
-                        "spoken_reply": spoken,
-                        "text_reply": text_content,
+                        "mode": "transit",
+                        "key": settings.GOOGLE_MAPS_API_KEY
                     }
+                    async with httpx.AsyncClient() as client:
+                        r = await client.get(url, params=params)
+                        if r.status_code == 200:
+                            data = r.json()
+                            routes = data.get("routes", [])
+                            for idx, route in enumerate(routes[:5]):
+                                legs = route.get("legs", [{}])
+                                leg = legs[0] if legs else {}
+                                steps = [s for s in leg.get("steps", []) if s.get("travel_mode") == "TRANSIT"]
+                                for step in steps[:1]:
+                                    transit = step.get("transit_details", {})
+                                    line = transit.get("line", {})
+                                    dep = transit.get("departure_time", {}).get("text", "N/A")
+                                    arr = transit.get("arrival_time", {}).get("text", "N/A")
+                                    dep_stop_name = transit.get("departure_stop", {}).get("name", origin)
+                                    arr_stop_name = transit.get("arrival_stop", {}).get("name", destination)
+                                    parsed_trains.append({
+                                        "id": f"TRN_GM_{idx + 1}",
+                                        "name": line.get("name", "Rail Service"),
+                                        "code": line.get("short_name", f"RAIL{idx + 1}"),
+                                        "from": dep_stop_name,
+                                        "to": arr_stop_name,
+                                        "departure": dep,
+                                        "arrival": arr,
+                                        "price": "Check IRCTC for fares",
+                                        "schedule": "Via Google Maps Transit",
+                                        "class": train_class,
+                                        "date": date,
+                                        "source": "Google Maps API",
+                                    })
+                    logger.info(f"[TRAIN API] Google Maps returned {len(parsed_trains)} routes")
+                except Exception as gm_err:
+                    logger.warning(f"[TRAIN API] Google Maps API error: {gm_err}")
 
-                # ── Priority 1: Google Maps MCP Hotels (Places API) ──
-                if settings.GOOGLE_MAPS_API_KEY:
-                    logger.info(f"[HOTEL MCP] Trying Google Maps searchPlaces for hotels in {origin}")
-                    try:
-                        gm_result = await call_mcp_tool_async(
-                            server_cmd="npx",
-                            server_args=["-y", "@gongrzhe/server-travelplanner-mcp"],
-                            tool_name="searchPlaces",
-                            arguments={
-                                "query": f"hotels in {origin}",
-                            },
-                        )
-                        if gm_result.get("status") == "success":
-                            content = gm_result.get("content", {})
-                            places = []
-                            if isinstance(content, list):
-                                places = content
-                            elif isinstance(content, dict):
-                                places = content.get("results", []) or content.get("places", []) or []
+            # ── Fallback: Tavily scraped results + curated route data ─────────
 
-                            mcp_hotels = []
-                            image_tasks = []
-                            for idx, p in enumerate(places[:5]):
-                                name = p.get("name", "Premium Hotel")
-                                rating_val = p.get("rating", 4.0)
-                                review_count = p.get("user_ratings_total") or p.get("userRatingCount") or 150
-                                formatted_address = p.get("formatted_address") or p.get("formattedAddress") or origin
-                                
-                                photos = p.get("photos", []) or p.get("photo", []) or []
-                                photo_urls = []
-                                if photos and isinstance(photos, list) and settings.GOOGLE_MAPS_API_KEY:
-                                    for ph in photos[:3]:
-                                        ref = ph.get("photo_reference") or ph.get("photoReference")
-                                        if ref:
-                                            photo_urls.append(f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photoreference={ref}&key={settings.GOOGLE_MAPS_API_KEY}")
-                                
-                                mcp_hotels.append({
-                                    "id": f"HTL_GM_{idx + 1}",
-                                    "name": name,
-                                    "location": formatted_address,
-                                    "rating": f"{rating_val} ★ ({review_count} reviews)",
-                                    "price": f"₹{4500 + idx * 800}/night",
-                                    "phone": "1800-102-3000",
-                                    "desc": f"Highly rated hotel in {origin}. Address: {formatted_address}.",
-                                    "images": photo_urls or CURATED_HOTEL_IMAGES[idx % len(CURATED_HOTEL_IMAGES)],
-                                    "amenities": ["Free Wi-Fi", "Air conditioning", "Room service"]
-                                })
-                                
-                                if not photo_urls:
-                                    image_tasks.append((idx, _get_real_hotel_images(name)))
-                                    
-                            if image_tasks:
-                                idxs, tasks = zip(*image_tasks)
-                                fetched_images = await asyncio.gather(*tasks)
-                                for i, imgs in zip(idxs, fetched_images):
-                                    if imgs:
-                                        mcp_hotels[i]["images"] = imgs
-                            if mcp_hotels:
-                                parts = [f"{i+1}. {h['name']} in {origin} starting at {h['price']}" for i, h in enumerate(mcp_hotels)]
-                                text_content = f"Found {len(mcp_hotels)} hotels in {origin} on {date}.\n\n" + "\n".join(parts)
-                                spoken = f"I successfully located {len(mcp_hotels)} hotel options in {origin} today via Google Places. You can review them on screen."
-                                return {
-                                    "status": "ok",
-                                    "service_type": service_type,
-                                    "origin": origin,
-                                    "destination": destination,
-                                    "date": date,
-                                    "results": mcp_hotels,
-                                    "source": "Google Places MCP",
-                                    "spoken_reply": spoken,
-                                    "text_reply": text_content,
-                                }
-                    except Exception as gm_err:
-                        logger.warning(f"[HOTEL MCP] Google Maps MCP error: {gm_err}")
 
-                results = tavily_results
-                real_hotels = _filter_hotel_results(results)
-                parsed_hotels = []
-                if real_hotels:
-                    # Determine proximity/distance assignment
-                    origin_clean = origin.strip().lower().replace(",", " ").split()
-                    MAJOR_CITIES = {"chennai", "mumbai", "kolkata", "calcutta", "delhi", "bengaluru", "bangalore", "hyderabad", "london", "dubai", "singapore", "tokyo", "goa", "pune", "ahmedabad", "jaipur", "kochi", "lucknow"}
-                    is_specific = (
-                        origin.strip().lower() not in MAJOR_CITIES
-                        or len(origin_clean) > 1
-                        or "," in origin
-                        or any(x in origin.lower() for x in ["zone", "park", "street", "road", "mall", "airport", "station", "building", "tech", "office", "embassy", "university", "hospital", "nagar", "pallavarm", "pallavaram", "velachery", "guindy", "omr", "ecr", "mylapore", "tambaram", "adyar"])
-                    )
-
-                    # Parse and return real-time hotels
-                    for idx, r in enumerate(real_hotels[:5]):
-                        title_raw = r.get("title") or r.get("name") or r.get("hotel") or "Premium Hotel"
-                        title = re.sub(r"\s+", " ", title_raw).replace("###", "").strip()
-                        snippet_raw = r.get("snippet") or r.get("content") or ""
-                        snippet = re.sub(r"\s+", " ", snippet_raw).replace("###", "").strip()
+            real_trains = _filter_train_results(results)
+            if real_trains:
+                # Parse and return real-time trains
+                for idx, r in enumerate(real_trains[:5]):
+                    title_raw = r.get("title") or r.get("name") or "Express Train"
+                    title = re.sub(r"\s+", " ", title_raw).replace("###", "").strip()
+                    snippet_raw = r.get("snippet") or r.get("content") or ""
+                    snippet = re.sub(r"\s+", " ", snippet_raw).replace("###", "").strip()
+                    # Clean title
+                    clean_title = title.split(" - ")[0].split(" | ")[0].split(" (")[0].strip()
+                    clean_title = re.sub(r"[()\[\]]", "", clean_title)
                         
-                        clean_title = r.get("clean_name") or title.split(" - ")[0].split(" | ")[0].strip()
-                        clean_title = re.sub(r"\b(cheap hotels|hotel booking|hotels|in|at|room|stay)\b", "", clean_title, flags=re.IGNORECASE).strip(" ,.!?")
-                        clean_title = re.sub(r"[0-9$₹%@+|,.:;*#&!?()\[\]_]", " ", clean_title)
-                        clean_title = re.sub(r"\s+", " ", clean_title).strip()
+                    # Extract price or compile a dynamic fare
+                    p_match = re.search(r"(?:₹|Rs\.?|INR)\s*(\d{1,3}(?:,\d{3})+|\d+)", snippet + " " + title)
+                    price_val = f"₹{p_match.group(1)}" if p_match else f"₹{1200 + idx*350}"
 
-                        # Extract price or compile a dynamic rate
-                        p_match = re.search(r"(?:₹|Rs\.?|INR)\s*(\d{1,3}(?:,\d{3})+|\d+)", snippet + " " + title)
-                        price_val = f"₹{p_match.group(1)}/night" if p_match else f"₹{3500 + idx*1200:,}/night"
+                    code_match = re.search(r"\b(\d{5})\b", snippet + " " + title)
+                    code_val = code_match.group(1) if code_match else f"{12000 + idx * 150}"
 
-                        # Distance from search location
-                        dist_val = 0.5 + idx * 0.6
-                        location_val = f"{dist_val:.1f} km from {origin.strip().title()}" if is_specific else origin.strip().title()
+                    time_match = re.search(r"\b(\d{2}:\d{2})\b", snippet + " " + title)
+                    time_val = time_match.group(1) if time_match else f"{6 + idx*3:02d}:15"
 
-                        parsed_hotels.append({
-                            "id": f"HTL{idx + 1}",
-                            "name": clean_title,
-                            "location": location_val,
-                            "rating": f"{4.2 + (idx % 3)*0.2:.1f} ★ ({120 + idx*40} reviews)",
-                            "price": price_val,
-                            "phone": f"1800-102-{3000 + idx * 150}",
-                            "desc": snippet[:150] + "..." if len(snippet) > 150 else (snippet or f"Welcome to premium hospitality near {origin.strip().title()}."),
-                            "images": CURATED_HOTEL_IMAGES[idx % len(CURATED_HOTEL_IMAGES)],
-                            "amenities": ["Free Wi-Fi", "Air conditioning", "Room service"]
-                        })
-
-                    # Fetch real hotel images concurrently
-                    image_tasks = [(i, _get_real_hotel_images(h["name"])) for i, h in enumerate(parsed_hotels)]
-                    if image_tasks:
-                        idxs, tasks = zip(*image_tasks)
-                        fetched_images = await asyncio.gather(*tasks)
-                        for i, imgs in zip(idxs, fetched_images):
-                            if imgs:
-                                parsed_hotels[i]["images"] = imgs
-
-                    # Pad to exactly 5 results if needed
-                    if len(parsed_hotels) < 5:
-                        needed = 5 - len(parsed_hotels)
-                        proximity_fallbacks = _generate_proximity_hotels(origin)
-                        seen_names = {h["name"].lower() for h in parsed_hotels}
-                        added = 0
-                        for h in proximity_fallbacks:
-                            if added >= needed:
-                                break
-                            if h["name"].lower() not in seen_names:
-                                h["id"] = f"HTL{len(parsed_hotels) + 1}"
-                                parsed_hotels.append(h)
-                                seen_names.add(h["name"].lower())
-                                added += 1
-                else:
-                    parsed_hotels = _generate_proximity_hotels(origin)
-                
-                parts = [f"{i+1}. {h['name']} in {origin} starting at {h['price']} | Rating: {h.get('rating', '4.2 ★')} | Highlights: {h.get('desc', 'A high-end lodging stay.')} | Amenities: {', '.join(h.get('amenities', [])) if isinstance(h.get('amenities'), list) else h.get('amenities', '')}" for i, h in enumerate(parsed_hotels)]
-                text_content = f"Found {len(parsed_hotels)} hotels in {origin} on {date}.\n\n" + "\n".join(parts)
-                spoken = f"I successfully located {len(parsed_hotels)} hotel options in {origin} today. You can review them on screen."
-                
-                return {
-                    "status": "ok",
-                    "service_type": service_type,
-                    "origin": origin,
-                    "destination": destination,
-                    "date": date,
-                    "results": parsed_hotels,
-                    "source": "Tavily Web Search",
-                    "spoken_reply": spoken,
-                    "text_reply": text_content,
-                }
-                
-            elif service_type == "trains":
-                results = tavily_results
-                train_class = args.get("train_class") or "AC First Class (1A)"
-                parsed_trains = []
-
-                orig_lower = origin.strip().lower()
-                dest_lower = destination.strip().lower()
-
-                # ── Priority 1: Google Maps API (transit directions) ──────────────
-                if settings.GOOGLE_MAPS_API_KEY and not parsed_trains:
-                    logger.info(f"[TRAIN API] Trying Google Maps Directions API for {origin} → {destination}")
-                    try:
-                        url = "https://maps.googleapis.com/maps/api/directions/json"
-                        params = {
-                            "origin": origin,
-                            "destination": destination,
-                            "mode": "transit",
-                            "key": settings.GOOGLE_MAPS_API_KEY
-                        }
-                        async with httpx.AsyncClient() as client:
-                            r = await client.get(url, params=params)
-                            if r.status_code == 200:
-                                data = r.json()
-                                routes = data.get("routes", [])
-                                for idx, route in enumerate(routes[:5]):
-                                    legs = route.get("legs", [{}])
-                                    leg = legs[0] if legs else {}
-                                    steps = [s for s in leg.get("steps", []) if s.get("travel_mode") == "TRANSIT"]
-                                    for step in steps[:1]:
-                                        transit = step.get("transit_details", {})
-                                        line = transit.get("line", {})
-                                        dep = transit.get("departure_time", {}).get("text", "N/A")
-                                        arr = transit.get("arrival_time", {}).get("text", "N/A")
-                                        dep_stop_name = transit.get("departure_stop", {}).get("name", origin)
-                                        arr_stop_name = transit.get("arrival_stop", {}).get("name", destination)
-                                        parsed_trains.append({
-                                            "id": f"TRN_GM_{idx + 1}",
-                                            "name": line.get("name", "Rail Service"),
-                                            "code": line.get("short_name", f"RAIL{idx + 1}"),
-                                            "from": dep_stop_name,
-                                            "to": arr_stop_name,
-                                            "departure": dep,
-                                            "arrival": arr,
-                                            "price": "Check IRCTC for fares",
-                                            "schedule": "Via Google Maps Transit",
-                                            "class": train_class,
-                                            "date": date,
-                                            "source": "Google Maps API",
-                                        })
-                        logger.info(f"[TRAIN API] Google Maps returned {len(parsed_trains)} routes")
-                    except Exception as gm_err:
-                        logger.warning(f"[TRAIN API] Google Maps API error: {gm_err}")
-
-                # ── Fallback: Tavily scraped results + curated route data ─────────
-
-
-                real_trains = _filter_train_results(results)
-                if real_trains:
-                    # Parse and return real-time trains
-                    for idx, r in enumerate(real_trains[:5]):
-                        title_raw = r.get("title") or r.get("name") or "Express Train"
-                        title = re.sub(r"\s+", " ", title_raw).replace("###", "").strip()
-                        snippet_raw = r.get("snippet") or r.get("content") or ""
-                        snippet = re.sub(r"\s+", " ", snippet_raw).replace("###", "").strip()
-                        # Clean title
-                        clean_title = title.split(" - ")[0].split(" | ")[0].split(" (")[0].strip()
-                        clean_title = re.sub(r"[()\[\]]", "", clean_title)
-                        
-                        # Extract price or compile a dynamic fare
-                        p_match = re.search(r"(?:₹|Rs\.?|INR)\s*(\d{1,3}(?:,\d{3})+|\d+)", snippet + " " + title)
-                        price_val = f"₹{p_match.group(1)}" if p_match else f"₹{1200 + idx*350}"
-
-                        code_match = re.search(r"\b(\d{5})\b", snippet + " " + title)
-                        code_val = code_match.group(1) if code_match else f"{12000 + idx * 150}"
-
-                        time_match = re.search(r"\b(\d{2}:\d{2})\b", snippet + " " + title)
-                        time_val = time_match.group(1) if time_match else f"{6 + idx*3:02d}:15"
-
-                        parsed_trains.append({
-                            "id": f"TRN{idx + 1}",
-                            "name": clean_title,
-                            "code": code_val,
+                    parsed_trains.append({
+                        "id": f"TRN{idx + 1}",
+                        "name": clean_title,
+                        "code": code_val,
+                        "from": origin,
+                        "to": destination,
+                        "departure": time_val,
+                        "arrival": f"{(int(time_val.split(':')[0]) + 14) % 24:02d}:30",
+                        "price": price_val,
+                        "schedule": "Daily Runs",
+                        "class": train_class,
+                        "date": date
+                    })
+            else:
+                if "kota" in orig_lower and "prayagraj" in dest_lower:
+                    parsed_trains = [
+                        {
+                            "id": "TRN1",
+                            "name": "Jaipur Prayagraj SF Express",
+                            "code": "12404",
                             "from": origin,
                             "to": destination,
-                            "departure": time_val,
-                            "arrival": f"{(int(time_val.split(':')[0]) + 14) % 24:02d}:30",
-                            "price": price_val,
+                            "departure": "15:20",
+                            "arrival": "04:45",
+                            "price": "₹1,250",
                             "schedule": "Daily Runs",
                             "class": train_class,
                             "date": date
-                        })
+                        },
+                        {
+                            "id": "TRN2",
+                            "name": "Kota Patna Express",
+                            "code": "13240",
+                            "from": origin,
+                            "to": destination,
+                            "departure": "18:10",
+                            "arrival": "12:20",
+                            "price": "₹980",
+                            "schedule": "Mon, Tue, Sat",
+                            "class": train_class,
+                            "date": date
+                        },
+                        {
+                            "id": "TRN3",
+                            "name": "Ananya Express",
+                            "code": "12316",
+                            "from": origin,
+                            "to": destination,
+                            "departure": "06:20",
+                            "arrival": "22:10",
+                            "price": "₹1,450",
+                            "schedule": "Thu Only",
+                            "class": train_class,
+                            "date": date
+                        },
+                        {
+                            "id": "TRN4",
+                            "name": "Bikaner Prayagraj SF Express",
+                            "code": "20404",
+                            "from": origin,
+                            "to": destination,
+                            "departure": "12:40",
+                            "arrival": "04:45",
+                            "price": "₹1,180",
+                            "schedule": "Mon, Thu, Sat",
+                            "class": train_class,
+                            "date": date
+                        },
+                        {
+                            "id": "TRN5",
+                            "name": "Jodhpur Puri SF Express",
+                            "code": "20814",
+                            "from": origin,
+                            "to": destination,
+                            "departure": "21:35",
+                            "arrival": "15:25",
+                            "price": "₹1,850",
+                            "schedule": "Sat Only",
+                            "class": train_class,
+                            "date": date
+                        }
+                    ]
+                elif "kota" in orig_lower and "kolkata" in dest_lower:
+                    parsed_trains = [
+                        {
+                            "id": "TRN1",
+                            "name": "HWH Garbha Express",
+                            "code": "12937",
+                            "from": origin,
+                            "to": destination,
+                            "departure": "08:15",
+                            "arrival": "12:15",
+                            "price": "₹1,400",
+                            "schedule": "Wed Only",
+                            "class": train_class,
+                            "date": date
+                        },
+                        {
+                            "id": "TRN2",
+                            "name": "Santragachi Express",
+                            "code": "18010",
+                            "from": origin,
+                            "to": destination,
+                            "departure": "19:05",
+                            "arrival": "23:45",
+                            "price": "₹1,550",
+                            "schedule": "Mon Only",
+                            "class": train_class,
+                            "date": date
+                        },
+                        {
+                            "id": "TRN3",
+                            "name": "UDZ SHM Express",
+                            "code": "20971",
+                            "from": origin,
+                            "to": destination,
+                            "departure": "05:25",
+                            "arrival": "09:30",
+                            "price": "₹1,600",
+                            "schedule": "Sat Only",
+                            "class": train_class,
+                            "date": date
+                        },
+                        {
+                            "id": "TRN4",
+                            "name": "MDJN KOAA Express",
+                            "code": "19608",
+                            "from": origin,
+                            "to": destination,
+                            "departure": "14:40",
+                            "arrival": "18:25",
+                            "price": "₹1,200",
+                            "schedule": "Tue Only",
+                            "class": train_class,
+                            "date": date
+                        },
+                        {
+                            "id": "TRN5",
+                            "name": "Ananya Express",
+                            "code": "12316",
+                            "from": origin,
+                            "to": destination,
+                            "departure": "06:15",
+                            "arrival": "12:20",
+                            "price": "₹1,800",
+                            "schedule": "Thu Only",
+                            "class": train_class,
+                            "date": date
+                        }
+                    ]
                 else:
-                    if "kota" in orig_lower and "prayagraj" in dest_lower:
-                        parsed_trains = [
-                            {
-                                "id": "TRN1",
-                                "name": "Jaipur Prayagraj SF Express",
-                                "code": "12404",
-                                "from": origin,
-                                "to": destination,
-                                "departure": "15:20",
-                                "arrival": "04:45",
-                                "price": "₹1,250",
-                                "schedule": "Daily Runs",
-                                "class": train_class,
-                                "date": date
-                            },
-                            {
-                                "id": "TRN2",
-                                "name": "Kota Patna Express",
-                                "code": "13240",
-                                "from": origin,
-                                "to": destination,
-                                "departure": "18:10",
-                                "arrival": "12:20",
-                                "price": "₹980",
-                                "schedule": "Mon, Tue, Sat",
-                                "class": train_class,
-                                "date": date
-                            },
-                            {
-                                "id": "TRN3",
-                                "name": "Ananya Express",
-                                "code": "12316",
-                                "from": origin,
-                                "to": destination,
-                                "departure": "06:20",
-                                "arrival": "22:10",
-                                "price": "₹1,450",
-                                "schedule": "Thu Only",
-                                "class": train_class,
-                                "date": date
-                            },
-                            {
-                                "id": "TRN4",
-                                "name": "Bikaner Prayagraj SF Express",
-                                "code": "20404",
-                                "from": origin,
-                                "to": destination,
-                                "departure": "12:40",
-                                "arrival": "04:45",
-                                "price": "₹1,180",
-                                "schedule": "Mon, Thu, Sat",
-                                "class": train_class,
-                                "date": date
-                            },
-                            {
-                                "id": "TRN5",
-                                "name": "Jodhpur Puri SF Express",
-                                "code": "20814",
-                                "from": origin,
-                                "to": destination,
-                                "departure": "21:35",
-                                "arrival": "15:25",
-                                "price": "₹1,850",
-                                "schedule": "Sat Only",
-                                "class": train_class,
-                                "date": date
-                            }
-                        ]
-                    elif "kota" in orig_lower and "kolkata" in dest_lower:
-                        parsed_trains = [
-                            {
-                                "id": "TRN1",
-                                "name": "HWH Garbha Express",
-                                "code": "12937",
-                                "from": origin,
-                                "to": destination,
-                                "departure": "08:15",
-                                "arrival": "12:15",
-                                "price": "₹1,400",
-                                "schedule": "Wed Only",
-                                "class": train_class,
-                                "date": date
-                            },
-                            {
-                                "id": "TRN2",
-                                "name": "Santragachi Express",
-                                "code": "18010",
-                                "from": origin,
-                                "to": destination,
-                                "departure": "19:05",
-                                "arrival": "23:45",
-                                "price": "₹1,550",
-                                "schedule": "Mon Only",
-                                "class": train_class,
-                                "date": date
-                            },
-                            {
-                                "id": "TRN3",
-                                "name": "UDZ SHM Express",
-                                "code": "20971",
-                                "from": origin,
-                                "to": destination,
-                                "departure": "05:25",
-                                "arrival": "09:30",
-                                "price": "₹1,600",
-                                "schedule": "Sat Only",
-                                "class": train_class,
-                                "date": date
-                            },
-                            {
-                                "id": "TRN4",
-                                "name": "MDJN KOAA Express",
-                                "code": "19608",
-                                "from": origin,
-                                "to": destination,
-                                "departure": "14:40",
-                                "arrival": "18:25",
-                                "price": "₹1,200",
-                                "schedule": "Tue Only",
-                                "class": train_class,
-                                "date": date
-                            },
-                            {
-                                "id": "TRN5",
-                                "name": "Ananya Express",
-                                "code": "12316",
-                                "from": origin,
-                                "to": destination,
-                                "departure": "06:15",
-                                "arrival": "12:20",
-                                "price": "₹1,800",
-                                "schedule": "Thu Only",
-                                "class": train_class,
-                                "date": date
-                            }
-                        ]
-                    else:
-                        # General train list generator
-                        train_list = [
-                            ("Vande Bharat Express", "22401", "06:00", "14:10", 1250, "Daily Runs"),
-                            ("Rajdhani Express", "12952", "16:30", "08:30", 2450, "Daily Runs"),
-                            ("Shatabdi Express", "12002", "06:15", "14:40", 1150, "Daily Runs"),
-                            ("Duronto Express", "12260", "12:20", "06:15", 1850, "Tue, Thu, Sat"),
-                            ("Garib Rath Express", "12910", "20:00", "08:45", 850, "Wed, Fri, Sun")
-                        ]
-                        valid_count = max(min(len(results), 5), 5)
-                        for idx in range(valid_count):
-                            r = results[idx % len(results)] if results else {}
-                            snippet = r.get("snippet") or r.get("content") or ""
+                    # General train list generator
+                    train_list = [
+                        ("Vande Bharat Express", "22401", "06:00", "14:10", 1250, "Daily Runs"),
+                        ("Rajdhani Express", "12952", "16:30", "08:30", 2450, "Daily Runs"),
+                        ("Shatabdi Express", "12002", "06:15", "14:40", 1150, "Daily Runs"),
+                        ("Duronto Express", "12260", "12:20", "06:15", 1850, "Tue, Thu, Sat"),
+                        ("Garib Rath Express", "12910", "20:00", "08:45", 850, "Wed, Fri, Sun")
+                    ]
+                    valid_count = max(min(len(results), 5), 5)
+                    for idx in range(valid_count):
+                        r = results[idx % len(results)] if results else {}
+                        snippet = r.get("snippet") or r.get("content") or ""
                             
-                            name, code, dep, arr, base_p, sched = train_list[idx % len(train_list)]
+                        name, code, dep, arr, base_p, sched = train_list[idx % len(train_list)]
                             
-                            p_match = re.search(r"(?:₹|Rs\.?|INR)\s*(\d{1,3}(?:,\d{3})+|\d+)", snippet)
-                            price_val = f"₹{p_match.group(1)}" if p_match else f"₹{base_p + idx * 250}"
+                        p_match = re.search(r"(?:₹|Rs\.?|INR)\s*(\d{1,3}(?:,\d{3})+|\d+)", snippet)
+                        price_val = f"₹{p_match.group(1)}" if p_match else f"₹{base_p + idx * 250}"
                             
-                            parsed_trains.append({
-                                "id": f"TRN{idx + 1}",
-                                "name": name,
-                                "code": code,
-                                "from": origin,
-                                "to": destination,
-                                "departure": dep,
-                                "arrival": arr,
-                                "price": price_val,
-                                "schedule": sched,
-                                "class": train_class,
-                                "date": date
-                            })
+                        parsed_trains.append({
+                            "id": f"TRN{idx + 1}",
+                            "name": name,
+                            "code": code,
+                            "from": origin,
+                            "to": destination,
+                            "departure": dep,
+                            "arrival": arr,
+                            "price": price_val,
+                            "schedule": sched,
+                            "class": train_class,
+                            "date": date
+                        })
 
-                # Sort trains by price (Low to High)
-                def _get_price_val(t: dict) -> int:
-                    digits = "".join(c for c in str(t.get("price", "")) if c.isdigit())
-                    return int(digits) if digits else 999999
-                parsed_trains.sort(key=_get_price_val)
+            # Sort trains by price (Low to High)
+            def _get_price_val(t: dict) -> int:
+                digits = "".join(c for c in str(t.get("price", "")) if c.isdigit())
+                return int(digits) if digits else 999999
+            parsed_trains.sort(key=_get_price_val)
 
-                # Attach segments to each train
-                for idx, t in enumerate(parsed_trains):
-                    t["segments"] = _generate_train_segments(
-                        origin=origin,
-                        destination=destination,
-                        train_name=t["name"],
-                        train_code=t["code"],
-                        departure=t["departure"],
-                        arrival=t["arrival"],
-                        idx=idx
-                    )
+            # Attach segments to each train
+            for idx, t in enumerate(parsed_trains):
+                t["segments"] = _generate_train_segments(
+                    origin=origin,
+                    destination=destination,
+                    train_name=t["name"],
+                    train_code=t["code"],
+                    departure=t["departure"],
+                    arrival=t["arrival"],
+                    idx=idx
+                )
 
-                valid_count = len(parsed_trains)
-                parts = [
-                    f"{i + 1}. {t['name']} ({t['code']}) departing at {t['departure']} for {t['price']} | Class: {t.get('class', 'AC First Class (1A)')} | Arrival: {t.get('arrival', '22:15')} | Schedule: {t.get('schedule', 'Daily Runs')}"
-                    for i, t in enumerate(parsed_trains)
-                ]
-                text_content = f"Found {valid_count} trains from {origin} to {destination} on {date}.\n\n" + "\n".join(parts)
-                spoken = f"I successfully located {valid_count} train services from {origin} to {destination} on {date}. You can review them on screen."
+            valid_count = len(parsed_trains)
+            parts = [
+                f"{i + 1}. {t['name']} ({t['code']}) departing at {t['departure']} for {t['price']} | Class: {t.get('class', 'AC First Class (1A)')} | Arrival: {t.get('arrival', '22:15')} | Schedule: {t.get('schedule', 'Daily Runs')}"
+                for i, t in enumerate(parsed_trains)
+            ]
+            text_content = f"Found {valid_count} trains from {origin} to {destination} on {date}.\n\n" + "\n".join(parts)
+            spoken = f"I successfully located {valid_count} train services from {origin} to {destination} on {date}. You can review them on screen."
 
-                return {
-                    "status": "ok",
-                    "service_type": service_type,
-                    "origin": origin,
-                    "destination": destination,
-                    "date": date,
-                    "results": parsed_trains,
-                    "source": "MCP / Tavily / Curated",
-                    "spoken_reply": spoken,
-                    "text_reply": text_content,
-                }
+            return {
+                "status": "ok",
+                "service_type": service_type,
+                "origin": origin,
+                "destination": destination,
+                "date": date,
+                "results": parsed_trains,
+                "source": "MCP / Tavily / Curated",
+                "spoken_reply": spoken,
+                "text_reply": text_content,
+            }
 
-            else:
-                parts = []
-                for i, r in enumerate(tavily_results[:5]):
-                    parts.append(f"{i + 1}. {r.get('title')} ({r.get('url')})")
-                spoken = f"Found some live {service_type} search results for you. You can view them on screen."
-                text_content = f"Real-time search results for {service_type}:\n\n" + "\n".join(parts)
-                return {
-                    "status": "ok",
-                    "service_type": service_type,
-                    "origin": origin,
-                    "destination": destination,
-                    "date": date,
-                    "results": tavily_results,
-                    "source": "Tavily Web Search",
-                    "spoken_reply": spoken,
-                    "text_reply": text_content,
-                }
-        logger.info("Tavily API returned no results or failed. Falling back to MCP/Mock...")
+        else:
+            parts = []
+            for i, r in enumerate(tavily_results[:5]):
+                parts.append(f"{i + 1}. {r.get('title')} ({r.get('url')})")
+            spoken = f"Found some live {service_type} search results for you. You can view them on screen."
+            text_content = f"Real-time search results for {service_type}:\n\n" + "\n".join(parts)
+            return {
+                "status": "ok",
+                "service_type": service_type,
+                "origin": origin,
+                "destination": destination,
+                "date": date,
+                "results": tavily_results,
+                "source": "Tavily Web Search",
+                "spoken_reply": spoken,
+                "text_reply": text_content,
+            }
+    logger.info("Tavily API returned no results or failed. Falling back to MCP/Mock...")
 
     # ── Call Node MCP Server if configured ──
     mcp_response = {}

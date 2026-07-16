@@ -11,11 +11,13 @@ from backend.core.config import settings
 
 logger = logging.getLogger("pilot.tools.general_qa")
 
-GENERAL_QA_PROMPT = """You are PILOT, a helpful voice AI assistant.
-Provide a clear, detailed, and structured explanation in response to the user's question.
-If the query requires code, output a proper markdown code block with the correct programming language syntax highlighting.
-For general knowledge, structure your answer clearly with bullet points, headings, or numbered lists where appropriate to ensure excellent readability on screen.
-Avoid plain unformatted blocks of text."""
+GENERAL_QA_PROMPT = """You are PILOT, a helpful voice AI assistant. Your reply is spoken out loud,
+not read as a document — answer in 2-3 short, plain conversational sentences, maximum.
+No headings, no bullet/numbered lists, no markdown formatting, no multi-section breakdowns.
+Give the direct answer only — skip disclaimers, alternatives, and "here's how you could also..."
+tangents unless the user explicitly asked for options.
+Exception: if the user explicitly asks for code, reply with a short markdown code block plus
+one sentence of context — nothing else."""
 
 
 async def general_qa(args: dict, session_id: str) -> dict:
@@ -57,8 +59,8 @@ async def _try_ollama(query: str) -> str | None:
                 ],
                 think=False,  # disable Qwen3 thinking — fast spoken answers
                 options={
-                    "num_predict": 1024
-                },  # Allow enough tokens for complete code blocks and explanations
+                    "num_predict": 220
+                },  # 2-3 spoken sentences, with headroom for a short code block
                 stream=False,
             )
             if isinstance(response, dict):
@@ -84,7 +86,9 @@ async def _try_gemini(query: str) -> str | None:
             "gemini-pro",
             system_instruction=GENERAL_QA_PROMPT,
         )
-        resp = await model.generate_content_async(query)
+        resp = await model.generate_content_async(
+            query, generation_config={"max_output_tokens": 220}
+        )
         return resp.text.strip()
     except Exception as e:
         logger.warning(f"Gemini general_qa failed: {e}")
@@ -104,7 +108,7 @@ async def _try_groq(query: str) -> str | None:
                 {"role": "system", "content": GENERAL_QA_PROMPT},
                 {"role": "user", "content": query},
             ],
-            max_tokens=1024,
+            max_tokens=220,
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:

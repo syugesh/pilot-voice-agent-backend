@@ -37,8 +37,13 @@ async def create(
     db.add(PilotSession(session_id=sid, usecase=req.usecase, user_id=user_id))
     await db.commit()
     from backend.core.session_manager import session_manager
+    from backend.core.session_state import get_state
 
     session_manager.register(sid, user_id or 0, req.usecase)
+    # ActiveSession (session_manager) and SessionPipelineState (session_state,
+    # what the ASR pipeline reads per-turn) are separate objects — sync here
+    # too, or state.usecase silently stays at its dataclass default.
+    get_state(sid).usecase = req.usecase
     return {"session_id": sid, "usecase": req.usecase, "state": "IDLE"}
 
 

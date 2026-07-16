@@ -79,7 +79,14 @@ class WhisperSTTProvider:
         if "large-v3-turbo" in preferred or ("turbo" in preferred and "large" in preferred):
             return "mlx-community/whisper-large-v3-turbo-q4"
         elif "distil-large-v3" in preferred:
-            return "mlx-community/distil-whisper-large-v3-turbo-q4"
+            # No quantized ("-q4"/"-4bit"/"-8bit") build of distil-whisper-large-v3
+            # exists on mlx-community (verified against the HF API) — the
+            # "-turbo-q4" suffix here previously pointed at a repo that was
+            # never real, silently failing every load and falling back to a
+            # slower path. This is the actual, existing repo (fp16, but still
+            # far faster than full large-v3 thanks to distil's 2-layer
+            # decoder vs. large-v3's 32).
+            return "mlx-community/distil-whisper-large-v3"
         elif preferred in ["medium", "small", "base", "tiny"]:
             return f"mlx-community/whisper-{preferred}-mlx-4bit"
         else:

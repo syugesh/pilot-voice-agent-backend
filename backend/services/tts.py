@@ -1,5 +1,5 @@
 """
-TTS — Kokoro ONNX local primary (from capstone_project1_2) → edge-tts → macOS say → espeak-ng.
+TTS — edge-tts primary → Kokoro ONNX local fallback (from capstone_project1_2) → macOS say → espeak-ng.
 All output is audio/wav or audio/mp3 — universally supported by browsers.
 """
 # postpones the evaluation of type annotations, converting them into plain strings at runtime instead of evaluating them immediately
@@ -119,9 +119,9 @@ def _speed_str(speed: float) -> str:
     return f"+{pct}%" if pct >= 0 else f"{pct}%"
 
 
-#   → Try Kokoro (Tier 1)
+#   → Try edge-tts (Tier 1) — cloud, multilingual, primary
 #        ↓ fails
-#   → Try edge-tts (Tier 2) — also the first choice for non-English
+#   → Try Kokoro (Tier 2) — local ONNX fallback, English only
 #        ↓ fails
 #   → macOS? → say/afconvert (Tier 3)
 #   → else  → espeak-ng (Tier 4)
@@ -129,7 +129,7 @@ def _speed_str(speed: float) -> str:
 #   → return empty bytes
 
 
-# ── Tier 2: edge-tts (MP3) (Cloud Default / Multilingual) ───────────────────────
+# ── Tier 1: edge-tts (MP3) (Cloud Default / Multilingual) ───────────────────────
 async def _edge_tts(text: str, speed: float) -> bytes:
     import edge_tts
 
@@ -249,22 +249,22 @@ async def tts_to_bytes(text: str, speed: float = 1.1) -> tuple[bytes, str]:
     detected_lang = _detect_lang(cleaned_text)
     logger.info(f"TTS Language Detection: '{detected_lang}' for text '{cleaned_text[:30]}...'")
 
-    # Tier 1: Local Kokoro ONNX (Primary only for English)
+    # Tier 1: edge-tts (Primary — cloud, multilingual)
+    try:
+        data = await _edge_tts(cleaned_text, speed)
+        logger.info(f"edge-tts ok ({detected_lang}): {len(data)}b")
+        return data, "audio/mp3"
+    except Exception as e:
+        logger.warning(f"edge-tts failed ({e}) — trying local Kokoro ONNX fallback")
+
+    # Tier 2: Local Kokoro ONNX (Fallback — English only)
     if _kokoro_instance and detected_lang == "en":
         try:
             data = await _kokoro_tts(cleaned_text, speed=1.0)
             logger.info(f"Local Kokoro ONNX ok (en): {len(data)}b")
             return data, "audio/wav"
         except Exception as e:
-            logger.warning(f"Local Kokoro ONNX failed ({e}) — trying edge-tts")
-
-    # Tier 2: edge-tts for Multilingual support (Hindi, French, Spanish, Tamil, etc.)
-    try:
-        data = await _edge_tts(cleaned_text, speed)
-        logger.info(f"edge-tts ok ({detected_lang}): {len(data)}b")
-        return data, "audio/mp3"
-    except Exception as e:
-        logger.warning(f"edge-tts failed ({e}) — using system fallback TTS")
+            logger.warning(f"Local Kokoro ONNX failed ({e}) — using system fallback TTS")
 
     # Tier 3/4: system TTS → WAV
     try:

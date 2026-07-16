@@ -91,7 +91,24 @@ async def ws_audio(websocket: WebSocket, session_id: str):
                     usecase = s.usecase
         except Exception as e:
             logger.error(f"Failed to load session user from DB: {e}")
+        # Talkinia meeting sessions never go through POST /sessions (see
+        # TALKINIA_STREAM/components/MeetingRoom.tsx) — they connect
+        # straight to this WS with a synthetic session_id shaped
+        # "meeting_{meetingId}", so there's never a matching PilotSession
+        # row and usecase stays "unknown" above. That id shape is a
+        # reliable signal on its own to route them into "meeting" usecase
+        # instead, which asr_worker.py uses to stay passive (listen +
+        # transcribe only, respond only to an explicit wake-word command)
+        # rather than treating ambient conversation as commands.
+        if usecase == "unknown" and session_id.startswith("meeting_"):
+            usecase = "meeting"
         session_manager.register(session_id, db_user_id, usecase)
+        # ActiveSession (session_manager) and SessionPipelineState
+        # (session_state, what the ASR pipeline actually reads per-turn)
+        # are two separate objects — sync the resolved usecase onto both,
+        # or state.usecase silently stays at its dataclass default
+        # ("general") regardless of what this session's real usecase is.
+        get_state(session_id).usecase = usecase
 
     # once the manager got the session metadata , the session is registered in the state manager and transitioned to listening . 
     await session_manager.transition(session_id, SessionState.LISTENING)
@@ -105,8 +122,15 @@ async def ws_audio(websocket: WebSocket, session_id: str):
 
             chunk = RawAudioChunk(pcm=data, session_id=session_id, timestamp=time.time())
 
-            # RMS-based barge-in is disabled to prevent ambient/echo noise from interrupting PILOT.
-            # Interruption and cancellation are handled exclusively via explicit stop words (e.g. "stop", "cancel").
+            # RMS-based barge-in (stop TTS the instant real speech is heard,
+            # not just on a recognized "stop" phrase) lives in
+            # pipeline/vad/silero_vad.py's SileroVADWorker._maybe_barge_in —
+            # guarded by a post-TTS-start grace window there specifically to
+            # avoid the ambient/mic-echo self-interruption problem this
+            # comment used to warn about. Explicit stop words ("stop",
+            # "cancel") are a separate, more drastic path that also cancels
+            # the in-flight background job — see ws_events.py's
+            # stop_command handler.
 
             try:
                 bus.raw_audio_q.put_nowait(chunk)

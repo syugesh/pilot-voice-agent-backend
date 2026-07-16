@@ -63,9 +63,22 @@ class WeSpeakerEmbedder:
             from backend.core.config import settings
 
             cache_dir = Path.home() / ".cache" / "wespeaker"
-            model_path = hf_hub_download(
-                repo_id=self.MODEL_REPO, filename=self.MODEL_FILE, cache_dir=str(cache_dir)
-            )
+            try:
+                # Cache-only first — hf_hub_download() normally does a HEAD
+                # request to HF on every call, even when the file is already
+                # cached, to check for a newer version. That's a real
+                # network dependency and a small delay on every single
+                # backend restart for a model that never changes once
+                # pinned by version. Skip that entirely if it's already on
+                # disk; only reach out to the network the first time.
+                model_path = hf_hub_download(
+                    repo_id=self.MODEL_REPO, filename=self.MODEL_FILE,
+                    cache_dir=str(cache_dir), local_files_only=True,
+                )
+            except Exception:
+                model_path = hf_hub_download(
+                    repo_id=self.MODEL_REPO, filename=self.MODEL_FILE, cache_dir=str(cache_dir)
+                )
             # Same device-selection pattern as Kokoro TTS (services/tts.py):
             # CoreML (Apple GPU/ANE) when settings.PREFERRED_DEVICE == "mps"
             # and onnxruntime actually has the provider available, else CPU.
@@ -214,8 +227,13 @@ class PyannoteProvider(DiarizeProvider):
                 best_score = score
                 best_label = label
 
-        # Cosine similarity threshold of 0.72 for matching voice centroids
-        if best_score >= 0.72:
+        # Same cosine-similarity threshold as enrollment/identity matching
+        # (settings.COSINE_THRESHOLD) — previously a separate hardcoded 0.72
+        # here, so lowering COSINE_THRESHOLD for identity matching had no
+        # effect on in-session clustering at all, and the same physical
+        # speaker kept getting split into new spk-N clusters turn to turn.
+        from backend.core.config import settings as _settings
+        if best_score >= _settings.COSINE_THRESHOLD:
             # Update centroid running mean smoothly to adapt to user position/inflection
             for idx, (label, centroid) in enumerate(centroids):
                 if label == best_label:

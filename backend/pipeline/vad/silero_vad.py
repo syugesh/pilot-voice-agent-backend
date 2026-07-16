@@ -27,6 +27,38 @@ class SileroVADWorker:
         self._silence_cnt = 0
         self._speech_cnt = 0
 
+    async def _maybe_barge_in(self, session_id: str):
+        """Stop-on-any-noise barge-in: the instant real speech (i.e. it
+        already passed ENERGY_THRESHOLD, so keyboard/fan/ambient noise is
+        already filtered out) is detected while PILOT is mid-speech, cut TTS
+        playback immediately — full turn/ASR/stop-word recognition is too
+        slow for this ("even a single noise" should interrupt, not just a
+        recognized "stop" phrase). Only cancels TTS — the in-flight
+        background job (if any) is untouched and keeps running; that's the
+        separate, more drastic "stop"/"cancel" spoken-phrase path
+        (ws_events.py's stop_command handler), not this one.
+        """
+        from backend.core.session_state import get_state
+
+        state = get_state(session_id)
+        if not state.tts_playing:
+            return
+        # Grace period right after TTS starts — guards against the mic
+        # picking up PILOT's own voice through speaker bleed/echo as if it
+        # were the user interrupting (this is exactly the "RMS-based
+        # barge-in" failure mode that got the old version of this disabled
+        # — see ws_audio.py's comment — so this window is what makes it
+        # safe to re-enable).
+        if time.time() - state.tts_start_time < 0.6:
+            return
+
+        from backend.core.cancel_tokens import cancel_tts
+
+        state.tts_playing = False
+        cancel_tts()
+        await self.bus.emit_event("barge_in", {}, session_id)
+        logger.info(f"[{session_id[:6]}] Barge-in: speech detected during TTS playback — stopping audio only")
+
     def _rms(self, pcm: bytes) -> float:
         if len(pcm) < 2:
             return 0.0
@@ -85,6 +117,7 @@ class SileroVADWorker:
                 self._buffer = []
                 self._silence_cnt = 0
                 self._speech_cnt = 0
+                await self._maybe_barge_in(session_id)
             self._buffer.append(frame)
             self._speech_cnt += 1
             self._silence_cnt = 0

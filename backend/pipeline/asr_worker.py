@@ -52,7 +52,7 @@ class ASRWorker:
             return
 
         # ── PRINT WHAT IS HEARD DIRECTLY TO TERMINAL ──
-        print(f'\n🎙️ [PILOT LISTENS] Speaker: {turn.speaker_id or "unknown"} | Text: "{text}"\n')
+        # print(f'\n🎙️ [PILOT LISTENS] Speaker: {turn.speaker_id or "unknown"} | Text: "{text}"\n')
 
         # Clean punctuation from the whole string to make wake word matching robust (e.g. "Hey, Pilot" -> "hey pilot")
         normalized_text = re.sub(r"[^\w\s]", "", text.lower()).strip()
@@ -74,6 +74,17 @@ class ASRWorker:
         is_sleep_word = any(
             s in normalized_text for s in ["stop listening", "go to sleep", "sleep pilot", "mute pilot"]
         )
+
+        # Meeting sessions (Talkinia — see ws_audio.py's "meeting_" session_id
+        # detection) are multiple people conversing WITH EACH OTHER, not with
+        # PILOT — no wake word needed and no commands recognized at all.
+        # Every sentence is just captured (diarized, shown live, kept in the
+        # ring buffer) for the eventual summary; nothing is ever routed to
+        # the Front LLM, so PILOT never tries to respond mid-meeting.
+        if state.usecase == "meeting":
+            await self._transcribe_only(turn, text)
+            await session_manager.transition(turn.session_id, SessionState.LISTENING)
+            return
 
         if is_sleep_word:
             state.ambient_listening_active = False
@@ -108,6 +119,8 @@ class ASRWorker:
                     "last slide",
                     "first slide",
                     "jump to slide",
+                    "go to slide",
+                    "slide number",
                 ]
             )
 
@@ -242,6 +255,30 @@ class ASRWorker:
 
         # → back to LISTENING (front LLM may override to DELEGATING/SPEAKING)
         await session_manager.transition(turn.session_id, SessionState.LISTENING)
+
+    async def _transcribe_only(self, turn: LabeledTurn, text: str):
+        """Meeting-usecase path for a non-wake-word utterance: still show it
+        live in the UI and keep it in the session's ring buffer (so an
+        eventual "summarize this meeting" request has the full conversation
+        to work from) — but deliberately does NOT put it on transcript_q, so
+        it never reaches the Front LLM and PILOT never tries to respond to
+        two people just talking to each other."""
+        from backend.core.session_state import get_state
+
+        get_state(turn.session_id).add_span(
+            {"speaker": turn.speaker_id, "role": turn.role, "text": text, "confidence": turn.confidence}
+        )
+        await self.bus.emit_event(
+            "transcript",
+            {
+                "text": text,
+                "speaker": turn.speaker_id or "You",
+                "role": turn.role or "user",
+                "confidence": round(turn.confidence, 3),
+                "timestamp": turn.timestamp,
+            },
+            turn.session_id,
+        )
 
 
 async def _score_sentiment(session_id: str, text: str, timestamp: float):

@@ -110,7 +110,7 @@ async def generate_reply(tool: str, result: dict, context: list = []) -> str | N
     if tool in ("ppt_navigate", "ppt_jump_to_title", "ppt_delete_slide"):
         return None
 
-    print(f"\n🧠 [AGENTIC ORCHESTRATOR] Processing background agent reply for tool '{tool}'.")
+    # print(f"\n🧠 [AGENTIC ORCHESTRATOR] Processing background agent reply for tool '{tool}'.")
 
     try:
         from backend.services.agentic.subagents import TravelSubAgent, SlidesSubAgent
@@ -133,7 +133,7 @@ async def generate_reply(tool: str, result: dict, context: list = []) -> str | N
 
         reply = await agent.call_llm(prompt)
         if reply:
-            print(f'✅ [LLM SUCCESS] {agent.name} responded successfully! Reply: "{reply[:80]}..."')
+            # print(f'✅ [LLM SUCCESS] {agent.name} responded successfully! Reply: "{reply[:80]}..."')
             return reply
 
     except Exception as e:

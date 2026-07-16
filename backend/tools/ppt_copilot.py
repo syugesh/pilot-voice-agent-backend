@@ -1879,7 +1879,7 @@
 #         await refresh_slide_thumbnails_async(effective_sid)
 #         await bus.emit_event("ppt_command", {"action": "refresh", "session_id": effective_sid}, session_id)
 # 
-#     asyncio.create_task(_background_refresh())
+#     _spawn_background_refresh(_background_refresh())
 #     return True
 # 
 # 
@@ -2334,7 +2334,7 @@
 #         await bus.emit_event("ppt_command", {"action": "goto", "index": new_index}, session_id)
 #         await bus.emit_event("ppt_command", {"action": "refresh", "session_id": effective_sid}, session_id)
 # 
-#     asyncio.create_task(_background_refresh())
+#     _spawn_background_refresh(_background_refresh())
 #     return True
 # ============================================================================
 # DISABLED: ppt copilot implementation transferred from
@@ -2585,7 +2585,7 @@
 #         await refresh_slide_thumbnails_async(effective_sid)
 #         await bus.emit_event("ppt_command", {"action": "refresh", "session_id": effective_sid}, session_id)
 #
-#     asyncio.create_task(_background_refresh())
+#     _spawn_background_refresh(_background_refresh())
 #     return True
 #
 #
@@ -3122,7 +3122,7 @@
 #         await bus.emit_event("ppt_command", {"action": "goto", "index": new_index}, session_id)
 #         await bus.emit_event("ppt_command", {"action": "refresh", "session_id": effective_sid}, session_id)
 #
-#     asyncio.create_task(_background_refresh())
+#     _spawn_background_refresh(_background_refresh())
 #     return True
 #
 #
@@ -3234,6 +3234,26 @@
 """PPT tools — navigate + jump to slide by number or title + summarize."""
 import asyncio, logging, re
 logger = logging.getLogger("pilot.tools.ppt")
+
+# asyncio.create_task() only holds a WEAK reference to the task via the event
+# loop — per Python's own docs, a task with no other strong reference can be
+# garbage-collected mid-execution, silently, before it finishes. The
+# fire-and-forget background-refresh tasks below (write the edit fast, regen
+# thumbnails + re-emit "refresh" afterward) had exactly this bug: no
+# reference was kept anywhere, so the background refresh would sometimes
+# vanish before ever updating _slide_store or telling the frontend to
+# refetch — "the edit succeeded (spoken reply happened) but the UI never
+# updated," intermittently, which is the signature of a GC-timing race, not
+# a real failure. Keeping a strong reference here (and dropping it via the
+# done-callback once actually finished) is the standard fix.
+_bg_refresh_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background_refresh(coro):
+    task = asyncio.create_task(coro)
+    _bg_refresh_tasks.add(task)
+    task.add_done_callback(_bg_refresh_tasks.discard)
+    return task
 
 
 # ── Add-slide helpers — parse "where" out of the instruction, and detect
@@ -3471,7 +3491,7 @@ async def _apply_edit_and_background_refresh(effective_sid: str, idx: int, sessi
         await refresh_slide_thumbnails_async(effective_sid)
         await bus.emit_event("ppt_command", {"action": "refresh", "session_id": effective_sid}, session_id)
 
-    asyncio.create_task(_background_refresh())
+    _spawn_background_refresh(_background_refresh())
     return True
 
 
@@ -4008,7 +4028,7 @@ async def _apply_add_and_background_refresh(effective_sid: str, kind: str, data:
         await bus.emit_event("ppt_command", {"action": "goto", "index": new_index}, session_id)
         await bus.emit_event("ppt_command", {"action": "refresh", "session_id": effective_sid}, session_id)
 
-    asyncio.create_task(_background_refresh())
+    _spawn_background_refresh(_background_refresh())
     return True
 
 
@@ -4093,7 +4113,7 @@ async def ppt_reorder_slide(args: dict, session_id: str) -> dict:
             await refresh_slide_thumbnails_async(effective_sid)
             await bus.emit_event("ppt_command", {"action": "goto", "index": final_index}, session_id)
             await bus.emit_event("ppt_command", {"action": "refresh", "session_id": effective_sid}, session_id)
-        asyncio.create_task(_bg())
+        _spawn_background_refresh(_bg())
 
         # NOTE: upstream is missing this import at the call site below — every
         # other tool in this file imports get_state locally before using it;

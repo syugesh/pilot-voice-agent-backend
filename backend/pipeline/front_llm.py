@@ -258,9 +258,33 @@ def _sanitize_args(tool: str, args: dict) -> dict:
     return clean
 
 
+_TOOL_ALIAS_TO_SERVICE_TYPE = {"hotel_search": "hotels", "train_search": "trains", "cab_search": "cabs"}
+
+
+def _normalize_hallucinated_tool_name(decision: RouteDecision):
+    """The classifier's own SYSTEM_PROMPT and _KEYWORDS only ever use
+    "flight_search(service_type=...)" — there's no real "hotel_search"/
+    "train_search"/"cab_search"/"hotel_book"/etc. tool in TOOL_REGISTRY —
+    but Ollama occasionally hallucinates one of those more "obvious-sounding"
+    names anyway despite the correct instructions. Nothing downstream
+    validates the tool name before it reaches bg_supervisor (policy_gate
+    only checks permission, not whether the tool exists at all), so an
+    unrecognized name silently fails with "Unknown: hotel_search" — heard
+    by the user as "hotel_search isn't recognized" right after PILOT already
+    said it would help. Correct it here, the same way the (unused/dead)
+    agentic orchestrator.py already does for its own separate path."""
+    if decision.tool in _TOOL_ALIAS_TO_SERVICE_TYPE:
+        decision.args.setdefault("service_type", _TOOL_ALIAS_TO_SERVICE_TYPE[decision.tool])
+        decision.tool = "flight_search"
+    elif decision.tool in ("hotel_book", "train_book", "cab_book"):
+        decision.tool = "flight_book"
+
+
 async def _delegate(decision: RouteDecision):
     from backend.core.session_manager import SessionState, session_manager
     from backend.tools.policy import policy_gate
+
+    _normalize_hallucinated_tool_name(decision)
 
     allowed = await policy_gate.check(
         tool=decision.tool,
