@@ -61,6 +61,8 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          role-session-name: GitHubActions-${{ github.run_id }}
 
       - name: Login to Amazon ECR
         if: github.event_name != 'pull_request' && (github.ref_name == 'develop' || github.ref_name == 'main')
