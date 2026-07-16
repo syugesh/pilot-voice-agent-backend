@@ -1,0 +1,90 @@
+name: Backend Docker Image to ECR
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+
+  pull_request:
+    branches:
+      - develop
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: pilot-backend
+  DOCKERFILE_PATH: infra/Dockerfile.backend
+  DOCKER_BUILD_CONTEXT: .
+
+jobs:
+  build:
+    name: Build and Push Backend Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: vars
+        shell: bash
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+          if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            echo "IMAGE_TAG=prod" >> "$GITHUB_ENV"
+          elif [[ "${GITHUB_REF_NAME}" == "develop" ]]; then
+            echo "IMAGE_TAG=dev" >> "$GITHUB_ENV"
+          else
+            echo "IMAGE_TAG=pr-$SHORT_SHA" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build Docker image for PR validation only
+        if: github.event_name == 'pull_request'
+        run: |
+          docker build \
+            -f "$DOCKERFILE_PATH" \
+            -t "$ECR_REPOSITORY:test" \
+            "$DOCKER_BUILD_CONTEXT"
+
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request' && (github.ref_name == 'develop' || github.ref_name == 'main')
+        uses: aws-actions/configure-aws-credentials@v6.1.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        if: github.event_name != 'pull_request' && (github.ref_name == 'develop' || github.ref_name == 'main')
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push Docker image to ECR
+        if: github.event_name != 'pull_request' && (github.ref_name == 'develop' || github.ref_name == 'main')
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          SHORT_SHA: ${{ steps.vars.outputs.SHORT_SHA }}
+        run: |
+          IMAGE_URI="$REGISTRY/$ECR_REPOSITORY"
+
+          docker build \
+            -f "$DOCKERFILE_PATH" \
+            -t "$IMAGE_URI:$IMAGE_TAG" \
+            -t "$IMAGE_URI:$SHORT_SHA" \
+            "$DOCKER_BUILD_CONTEXT"
+
+          docker push "$IMAGE_URI:$IMAGE_TAG"
+          docker push "$IMAGE_URI:$SHORT_SHA"
+
+          echo "Pushed image: $IMAGE_URI:$IMAGE_TAG"
+          echo "Pushed image: $IMAGE_URI:$SHORT_SHA"
